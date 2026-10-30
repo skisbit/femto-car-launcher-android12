@@ -1,5 +1,5 @@
 
-name: Sync upstream and build Android 12
+name: Sync upstream and build Android 10 with ARM8
 
 on:
   schedule:
