@@ -174,7 +174,11 @@ android {
         // (old 32-bit AI boxes) simply has no libtripflyover.so, and the app
         // falls back to the 2D Compose renderer — never a crash.
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += listOf(
+            "arm64-v8a",
+            "armeabi-v7a",
+            "x86_64"
+        )
         }
 
         externalNativeBuild {
