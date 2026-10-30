@@ -1,0 +1,288 @@
+name: Sync upstream and build Android 12
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android12-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Check out Android 12 branch
+      - name: Check out Android 12 branch
+        uses: actions/checkout@v4
+        with:
+          ref: android12
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 2. Configure Git
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream \
+            https://github.com/seijikohara/femto-car-launcher.git
+
+      # 3. Merge upstream develop
+      - name: Merge upstream develop
+        run: |
+          git fetch upstream develop
+          git merge --no-edit -X theirs upstream/develop
+
+      - name: Restore fork workflow files
+        run: |
+          git fetch origin android12
+          git checkout origin/android12 -- .github/workflows/
+          git add .github/workflows/
+          if ! git diff --cached --quiet; then
+            git commit -m "Preserve fork GitHub Actions workflows"
+          fi
+
+      # 4. Enforce minimum SDK 29
+      - name: Enforce minimum SDK 29
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("app/build.gradle.kts")
+          content = path.read_text()
+
+          updated, count = re.subn(
+              r'(?m)^(\s*minSdk\s*=\s*)\d+\b',
+              r'\g<1>29',
+              content
+          )
+
+          if count != 1:
+              raise SystemExit(
+                  f"Expected exactly one minSdk assignment; found {count}"
+              )
+
+          path.write_text(updated)
+          print("Verified: minSdk = 29")
+          PY
+
+          git add app/build.gradle.kts
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Enforce minSdk 29 for Android 10"
+          fi
+
+      # 5. Enable ARM7, ARM8 and x86_64 builds
+      - name: Enable ARM7 architecture
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("app/build.gradle.kts")
+          content = path.read_text()
+
+          pattern = (
+              r'abiFilters\s*\+=\s*listOf\s*\(([^)]*)\)'
+          )
+
+          matches = list(re.finditer(pattern, content))
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  f"Expected exactly one abiFilters list; found {len(matches)}"
+              )
+
+          replacement = '''abiFilters += listOf(
+                      "arm64-v8a",
+                      "armeabi-v7a",
+                      "x86_64"
+                  )'''
+
+          updated = re.sub(pattern, replacement, content, count=1)
+
+          path.write_text(updated)
+
+          for abi in ("arm64-v8a", "armeabi-v7a", "x86_64"):
+              if f'"{abi}"' not in updated:
+                  raise SystemExit(f"Missing ABI: {abi}")
+
+          print("Verified native ABI configuration:")
+          print(" - arm64-v8a")
+          print(" - armeabi-v7a")
+          print(" - x86_64")
+          PY
+
+          git add app/build.gradle.kts
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Add ARM7 native build support"
+          fi
+
+      # 6. Set up Java
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      # 7. Set up Android SDK
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          cmdline-tools-version: "14742923"
+          packages: ""
+
+      # 8. Install Android SDK packages
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking available Android SDK platforms..."
+
+          if ! sdkmanager --list | grep -Fq "platforms;android-37.0"; then
+            echo "ERROR: platforms;android-37.0 is not available."
+            echo "Available Android platform packages:"
+            sdkmanager --list | grep -E 'platforms;android-[0-9]+' || true
+            exit 1
+          fi
+
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-37.0" \
+            "build-tools;36.0.0"
+
+          yes | sdkmanager --licenses || true
+
+      # 9. Build APK
+      - name: Build Android 12 APK
+        run: |
+          chmod +x gradlew
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          ./gradlew --no-daemon assembleStableDebug
+
+      # 10. Locate and verify APK exists
+      - name: Verify APK exists
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="app/build/outputs/apk/stable/debug/app-stable-debug.apk"
+
+          if [ ! -f "$APK" ]; then
+            echo "Expected APK not found: $APK"
+            echo "Searching for generated APK files..."
+            find app/build/outputs/apk -type f -name '*.apk' || true
+            exit 1
+          fi
+
+          echo "Found APK: $APK"
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+      # 11. Verify APK minimum SDK
+      - name: Verify APK minimum SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="${{ steps.apk.outputs.path }}"
+          AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt"
+
+          if [ ! -x "$AAPT" ]; then
+            echo "ERROR: aapt not found at $AAPT"
+            exit 1
+          fi
+
+          "$AAPT" dump badging "$APK" \
+            | grep -E "package:|sdkVersion:|targetSdkVersion:"
+
+          SDK_VERSION=$(
+            "$AAPT" dump badging "$APK" \
+              | sed -n "s/.*sdkVersion:'\([0-9]*\)'.*/\1/p"
+          )
+
+          if [ "$SDK_VERSION" != "29" ]; then
+            echo "ERROR: Expected minimum SDK 29, got $SDK_VERSION"
+            exit 1
+          fi
+
+          echo "SUCCESS: APK minimum SDK is 29"
+
+      # 12. Verify ARM7, ARM8 and x86_64 native libraries
+      - name: Verify APK architectures
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="${{ steps.apk.outputs.path }}"
+
+          echo "Inspecting APK native libraries..."
+
+          unzip -Z1 "$APK" | grep '^lib/' || true
+
+          for ABI in arm64-v8a armeabi-v7a x86_64; do
+            if unzip -Z1 "$APK" | grep -q "^lib/$ABI/.*\.so$"; then
+              echo "SUCCESS: $ABI native libraries found"
+            else
+              echo "ERROR: No native libraries found for $ABI"
+              exit 1
+            fi
+          done
+
+          echo "SUCCESS: All three architectures are present."
+
+      # 13. Diagnose workflow file changes
+      - name: Diagnose workflow file changes
+        run: |
+          git diff --name-status origin/android12 HEAD -- .github/workflows/
+          git diff origin/android12 HEAD -- .github/workflows/ci.yml
+
+      # 14. Push synced source branch
+      - name: Push synced branch
+        run: git push origin HEAD:android12
+
+      # 15. Generate unique release tag
+      - name: Generate release tag
+        id: release_tag
+        shell: bash
+        run: |
+          TAG="android12-$(date -u +%Y%m%d)-run${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
+      # 16. Publish APK as a GitHub Release
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          APK="${{ steps.apk.outputs.path }}"
+          TAG="${{ steps.release_tag.outputs.tag }}"
+
+          gh release create "$TAG" \
+            "$APK" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target android12 \
+            --title "Android 10 APK - $TAG" \
+            --notes "Automated Android 10 build.
+
+          Minimum supported Android SDK: 29 (Android 10).
+          Compile SDK: 37.
+          Architectures: ARM7, ARM8, x86_64.
+          Source branch: android12.
+          Upstream: seijikohara/femto-car-launcher develop.
+
+          Built and verified by GitHub Actions."
