@@ -10,6 +10,10 @@ import io.github.seijikohara.femto.data.map.offline.RegionDownloadPhase
 import io.github.seijikohara.femto.data.map.offline.SavedRegion
 import io.github.seijikohara.femto.data.map.offline.TileBenchmarkOutcome
 import io.github.seijikohara.femto.data.map.offline.TileBenchmarkRow
+import io.github.seijikohara.femto.data.routing.InstalledRoutingTile
+import io.github.seijikohara.femto.data.routing.RerouteStats
+import io.github.seijikohara.femto.data.routing.RouteRun
+import io.github.seijikohara.femto.data.routing.RouteRunOutcome
 import org.junit.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -29,6 +33,7 @@ class MapFactsTest {
         tileBenchmark: TileBenchmarkOutcome? = null,
         tileBenchmarkRuns: Int = 0,
         offlineRegions: OfflineRegionsState? = null,
+        routing: RoutingFacts? = null,
     ) = mapFactsFrom(
         glEsVersion,
         backend,
@@ -43,6 +48,7 @@ class MapFactsTest {
         tileBenchmark,
         tileBenchmarkRuns,
         offlineRegions,
+        routing,
     )
 
     private fun savedRegion(sizeBytes: Long) = SavedRegion("r$sizeBytes", "Region $sizeBytes", sizeBytes, null, 0L)
@@ -490,6 +496,103 @@ class MapFactsTest {
             facts(tileBenchmark = TileBenchmarkOutcome.Failed("kanto-14-1-2")).single { it.label.startsWith("Tile") },
         )
     }
+
+    @Test
+    fun `a build without routing says so and reads no routing data`() {
+        val facts =
+            routingFacts(RoutingFacts(buildEnabled = false, tiles = null, lastRun = null, geocoderPresent = true))
+
+        assertEquals(
+            listOf(
+                DiagnosticFact("Routing", FactValue.Text("off in this build")),
+                DiagnosticFact("Geocoder", FactValue.Text("present")),
+            ),
+            facts,
+        )
+    }
+
+    @Test
+    fun `routing on the OSM map reports its data, the last route and the geocoder`() {
+        val facts =
+            routingFacts(
+                RoutingFacts(
+                    buildEnabled = true,
+                    tiles = listOf(routingTile("E130_N30", 48_000_000L), routingTile("E135_N30", 96_000_000L)),
+                    lastRun = RouteRun(RouteRunOutcome.TIMED_OUT, computingMs = 60_012L),
+                    geocoderPresent = false,
+                ),
+            )
+
+        assertEquals(
+            listOf(
+                DiagnosticFact("Routing", FactValue.Text("available")),
+                DiagnosticFact("Routing data", FactValue.Text("2 tiles, 144 MB")),
+                DiagnosticFact("Last route", FactValue.Text("timed out, 60012 ms")),
+                DiagnosticFact("Last reroute", FactValue.Text("none this session")),
+                DiagnosticFact("Geocoder", FactValue.Text("absent")),
+            ),
+            facts,
+        )
+    }
+
+    // "Offered": BRouter may still refuse the reference and search in full.
+    @Test
+    fun `the last reroute reports its outcome, time, count and whether a reference was offered`() {
+        val reroutes = RerouteStats(3, RouteRun(RouteRunOutcome.FOUND, computingMs = 63L), usedReference = true)
+
+        val facts = routingFacts(RoutingFacts(true, emptyList(), null, true, reroutes = reroutes))
+
+        assertEquals(
+            FactValue.Text("found, 63 ms, 3 this session, reference offered"),
+            facts.single { it.label == "Last reroute" }.value,
+        )
+    }
+
+    @Test
+    fun `a reroute without a reference says none was offered`() {
+        val reroutes = RerouteStats(1, RouteRun(RouteRunOutcome.MISSING_TILES, computingMs = 5L), usedReference = false)
+
+        val facts = routingFacts(RoutingFacts(true, emptyList(), null, true, reroutes = reroutes))
+
+        assertEquals(
+            FactValue.Text("missing tiles, 5 ms, 1 this session, no reference offered"),
+            facts.single { it.label == "Last reroute" }.value,
+        )
+    }
+
+    @Test
+    fun `routing facts never name a tile`() {
+        val facts =
+            routingFacts(
+                RoutingFacts(true, listOf(routingTile("E130_N30", 1L)), lastRun = null, geocoderPresent = true),
+            )
+
+        assertTrue(facts.none { "E130" in it.label || "E130" in it.value.toString() })
+        assertEquals(FactValue.Text("none this session"), facts.single { it.label == "Last route" }.value)
+    }
+
+    @Test
+    fun `routing on the Google backend is off`() {
+        assertEquals(
+            FactValue.Text("off (Google Maps backend)"),
+            routingFacts(RoutingFacts(true, emptyList(), null, true), backend = MapBackend.GOOGLEMAPS)
+                .single { it.label == "Routing" }
+                .value,
+        )
+    }
+
+    private fun routingFacts(
+        routing: RoutingFacts,
+        backend: MapBackend = MapBackend.OSM,
+    ): List<DiagnosticFact> {
+        val label = setOf("Routing", "Routing data", "Last route", "Last reroute", "Geocoder")
+        return facts(backend = backend, routing = routing).filter { it.label in label }
+    }
+
+    private fun routingTile(
+        name: String,
+        sizeBytes: Long,
+    ) = InstalledRoutingTile(name, sizeBytes, dataDateEpochMs = null, checkedAtEpochMs = null)
 
     @Test
     fun `an aborted benchmark is an error fact giving the reason`() {

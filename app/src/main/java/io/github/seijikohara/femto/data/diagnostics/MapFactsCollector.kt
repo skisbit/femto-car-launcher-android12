@@ -2,8 +2,10 @@ package io.github.seijikohara.femto.data.diagnostics
 
 import android.app.ActivityManager
 import android.content.Context
+import android.location.Geocoder
 import android.os.SystemClock
 import androidx.core.content.getSystemService
+import io.github.seijikohara.femto.R
 import io.github.seijikohara.femto.data.display.DisplayPreferences
 import io.github.seijikohara.femto.data.display.GoogleMapsRendering
 import io.github.seijikohara.femto.data.display.MapBackend
@@ -16,6 +18,13 @@ import io.github.seijikohara.femto.data.map.offline.RegionDownloadPhase
 import io.github.seijikohara.femto.data.map.offline.TileBenchmarkOutcome
 import io.github.seijikohara.femto.data.map.offline.TileBenchmarkResults
 import io.github.seijikohara.femto.data.map.offline.TileBenchmarkRow
+import io.github.seijikohara.femto.data.routing.InstalledRoutingTile
+import io.github.seijikohara.femto.data.routing.RerouteStats
+import io.github.seijikohara.femto.data.routing.Rerouter
+import io.github.seijikohara.femto.data.routing.RoutePlanner
+import io.github.seijikohara.femto.data.routing.RouteRun
+import io.github.seijikohara.femto.data.routing.RouteRunOutcome
+import io.github.seijikohara.femto.data.routing.RoutingTileStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
@@ -88,6 +97,7 @@ internal fun mapFactsFrom(
     tileBenchmark: TileBenchmarkOutcome? = null,
     tileBenchmarkRuns: Int = 0,
     offlineRegions: OfflineRegionsState? = null,
+    routing: RoutingFacts? = null,
 ): List<DiagnosticFact> =
     buildList {
         add(webGl2Fact(glEsVersion, webGl2Need(backend, googleRendering, hasGoogleMapId)))
@@ -99,7 +109,72 @@ internal fun mapFactsFrom(
             add(DiagnosticFact("Failures this session", FactValue.Text("$failureCount")))
         }
         offlineRegions?.let { addAll(offlineRegionFacts(it)) }
+        routing?.let { addAll(routingFacts(it, backend)) }
         addAll(tileBenchmarkFacts(tileBenchmark, tileBenchmarkRuns, nowElapsedRealtimeMs))
+    }
+
+/**
+ * What the route preview (#389 phase 3) needs to be judged on a head unit: whether the build and backend offer it,
+ * the routing data on the device, the last route, the reroutes, and the geocoder that text destinations need. [tiles]
+ * is null when the build offers no routing, which reads no file.
+ */
+internal data class RoutingFacts(
+    val buildEnabled: Boolean,
+    val tiles: List<InstalledRoutingTile>?,
+    val lastRun: RouteRun?,
+    val geocoderPresent: Boolean,
+    val reroutes: RerouteStats? = null,
+)
+
+// Counts, sizes and times only: a tile name says where the owner drives, and an engine message can too.
+private fun routingFacts(
+    facts: RoutingFacts,
+    backend: MapBackend,
+): List<DiagnosticFact> =
+    buildList {
+        add(
+            DiagnosticFact(
+                "Routing",
+                FactValue.Text(
+                    when {
+                        !facts.buildEnabled -> "off in this build"
+                        backend != MapBackend.OSM -> "off (Google Maps backend)"
+                        else -> "available"
+                    },
+                ),
+            ),
+        )
+        facts.tiles?.let { tiles ->
+            add(
+                DiagnosticFact(
+                    "Routing data",
+                    FactValue.Text("${tiles.size} tiles, ${tiles.sumOf { it.sizeBytes } / BYTES_PER_MEGABYTE} MB"),
+                ),
+            )
+        }
+        if (facts.buildEnabled) {
+            add(
+                DiagnosticFact(
+                    "Last route",
+                    FactValue.Text(facts.lastRun?.let { "${it.outcome.label()}, ${it.computingMs} ms" } ?: NO_RUN_YET),
+                ),
+            )
+            add(DiagnosticFact("Last reroute", FactValue.Text(facts.reroutes?.summaryOrNull() ?: NO_RUN_YET)))
+        }
+        add(DiagnosticFact("Geocoder", FactValue.Text(if (facts.geocoderPresent) "present" else "absent")))
+    }
+
+private const val NO_RUN_YET = "none this session"
+
+private fun RouteRunOutcome.label(): String = name.lowercase().replace('_', ' ')
+
+// Whether the reroute had a reference tells a slow reroute from a fast one: with it, BRouter stops where the new
+// route rejoins the old one. "Offered", since BRouter silently refuses a reference built under other profile
+// settings and then searches in full.
+private fun RerouteStats.summaryOrNull(): String? =
+    last?.let { run ->
+        val reference = if (usedReference == true) "reference offered" else "no reference offered"
+        "${run.outcome.label()}, ${run.computingMs} ms, $count this session, $reference"
     }
 
 // Counts and sizes only: the choice of regions can say where the owner drives, so no name enters the report.
@@ -394,7 +469,20 @@ internal class MapFactsCollector(
                         load()
                         state.value
                     },
+                    routing = routingFacts(),
                 ),
             )
         }
+
+    // A build without routing creates neither the tile store nor the planner.
+    private suspend fun routingFacts(): RoutingFacts {
+        val enabled = context.resources.getBoolean(R.bool.routing_enabled)
+        return RoutingFacts(
+            buildEnabled = enabled,
+            tiles = if (enabled) RoutingTileStore.get(context).installedTiles() else null,
+            lastRun = if (enabled) RoutePlanner.get(context).lastRunOrNull() else null,
+            geocoderPresent = Geocoder.isPresent(),
+            reroutes = if (enabled) Rerouter.get(context).stats.value else null,
+        )
+    }
 }

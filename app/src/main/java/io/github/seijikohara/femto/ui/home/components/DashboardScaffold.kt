@@ -52,7 +52,9 @@ import io.github.seijikohara.femto.data.display.DriverSide
 import io.github.seijikohara.femto.data.display.MotionTier
 import io.github.seijikohara.femto.data.music.MusicCardState
 import io.github.seijikohara.femto.data.places.PlaceTarget
+import io.github.seijikohara.femto.data.routing.RerouteStatus
 import io.github.seijikohara.femto.ui.destination.DestinationPanelHost
+import io.github.seijikohara.femto.ui.destination.LastFix
 import io.github.seijikohara.femto.ui.drawer.AppDrawerPanelHost
 import io.github.seijikohara.femto.ui.home.HomeAction
 import io.github.seijikohara.femto.ui.home.HomeUiState
@@ -314,6 +316,10 @@ private fun DashboardContent(
     // ViewModel. rememberSaveable keeps an open panel open across rotation.
     var appsExpanded by rememberSaveable { mutableStateOf(false) }
     var destinationExpanded by rememberSaveable { mutableStateOf(false) }
+    // A point a long press on the map picked, until the destination panel's
+    // ViewModel has taken it (DestinationPanelHost); the ViewModel keeps it
+    // from then on, across a rotation too.
+    var mapPick by remember { mutableStateOf<PlaceTarget.Point?>(null) }
     var nowPlayingExpanded by rememberSaveable { mutableStateOf(false) }
     var calendarExpanded by rememberSaveable { mutableStateOf(false) }
     var weatherExpanded by rememberSaveable { mutableStateOf(false) }
@@ -493,6 +499,18 @@ private fun DashboardContent(
         onOpenLicenses = { onAction(HomeAction.OpenLicenses) },
         mapSurface = mapSurface,
         attributionBottomInset = attributionBottomInset,
+        routeLine = uiState.activeRoute?.line,
+        // Where routing is offered, a long press on the map opens the
+        // destination panel on the pressed point.
+        onLongPress =
+            if (uiState.routingAvailable) {
+                { point ->
+                    mapPick = PlaceTarget.Point(point.latitude, point.longitude)
+                    destinationExpanded = true
+                }
+            } else {
+                null
+            },
     )
 
     // While a panel is open, the sliver of viewport outside the overlay box —
@@ -567,6 +585,8 @@ private fun DashboardContent(
         onCloseApps = { appsExpanded = false },
         destinationExpanded = destinationExpanded,
         onCloseDestination = { destinationExpanded = false },
+        mapPick = mapPick,
+        onConsumeMapPick = { mapPick = null },
         dismissOpenPanel = dismissOpenPanel,
         modifier = Modifier.fillMaxSize().padding(dockEdgePadding(dockPosition, dockExtent)),
         spectrum = spectrum,
@@ -678,6 +698,9 @@ private fun DashboardOverlays(
     onCloseApps: () -> Unit,
     destinationExpanded: Boolean,
     onCloseDestination: () -> Unit,
+    // A point a long press on the map picked, for the destination panel to take.
+    mapPick: PlaceTarget.Point?,
+    onConsumeMapPick: () -> Unit,
     // Non-null while any panel is open: the inner outside-tap catcher's action.
     dismissOpenPanel: (() -> Unit)?,
     modifier: Modifier = Modifier,
@@ -830,6 +853,10 @@ private fun DashboardOverlays(
                 glassConfig = glassConfig,
                 motionTier = motionTier,
                 onExpand = onExpandTrip,
+                route = uiState.activeRoute?.progress,
+                reroute = uiState.activeRoute?.reroute ?: RerouteStatus.NONE,
+                onClearRoute = { onAction(HomeAction.ClearRoute) },
+                clock = clock,
                 modifier =
                     Modifier
                         .onSizeChanged { onOverlayHeightChange(it.height) }
@@ -1096,7 +1123,9 @@ private fun DashboardOverlays(
         // The destination panel, opened by the dock's NAVIGATION button (see
         // the parent's OpenDestinations interception). Like the apps panel it
         // needs no "has data" gate: with no fix it still takes a query, and
-        // only "Save current location" waits for one.
+        // only "Save current location" waits for one. The panel takes the
+        // flag too, since the exit animation keeps it composed after the flag
+        // has turned: what the close ends must end as the flag turns.
         AnimatedVisibility(
             visible = destinationExpanded,
             enter = Motion.panelEnter(motionTier, MaterialTheme.motionScheme),
@@ -1104,11 +1133,20 @@ private fun DashboardOverlays(
             modifier = Modifier.fillMaxSize().padding(outerPad),
         ) {
             DestinationPanelHost(
-                currentPoint = uiState.location?.let { PlaceTarget.Point(it.latitude, it.longitude) },
+                lastFix =
+                    uiState.location?.let {
+                        LastFix(
+                            PlaceTarget.Point(it.latitude, it.longitude),
+                            elapsedRealtimeNanos = it.elapsedRealtimeNanos,
+                        )
+                    },
                 currentAddress = uiState.address?.displayString().orEmpty(),
+                visible = destinationExpanded,
                 onNavigate = { target, label -> onAction(HomeAction.Navigate(target, label)) },
                 onOpenMaps = { onAction(HomeAction.OpenMaps) },
                 onClose = onCloseDestination,
+                pickedPoint = mapPick,
+                onConsumePickedPoint = onConsumeMapPick,
                 hazeState = hazeState,
                 glassConfig = glassConfig,
                 modifier = Modifier.fillMaxSize(),

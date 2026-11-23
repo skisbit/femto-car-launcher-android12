@@ -130,11 +130,36 @@ class DashboardScreenshotTest {
     @Config(qualifiers = DashboardGeometries.HEAD_UNIT_853X512)
     fun dashboard_head_unit_dark() = capture("head-unit-853x512-dark", darkTheme = true)
 
+    // --- Route preview (issue #389 phase 3, nightly builds only): the speed
+    // readout grows its route row under the address. The tests run the stable
+    // build, where routing is off, so the state carries the route explicitly. ---
+
+    @Test
+    @Config(qualifiers = DashboardGeometries.HEAD_UNIT_853X512)
+    fun dashboard_head_unit_route() = capture("head-unit-853x512-route", uiState = DashboardFixtures.routeState)
+
+    @Test
+    @Config(qualifiers = DashboardGeometries.HEAD_UNIT_853X512)
+    fun dashboard_head_unit_route_dark() =
+        capture("head-unit-853x512-route-dark", darkTheme = true, uiState = DashboardFixtures.routeState)
+
+    // The vehicle left the route: "Rerouting…" takes the arrival time's place.
+    @Test
+    @Config(qualifiers = DashboardGeometries.HEAD_UNIT_853X512)
+    fun dashboard_head_unit_rerouting() =
+        capture("head-unit-853x512-rerouting", uiState = DashboardFixtures.reroutingState)
+
+    @Test
+    @Config(qualifiers = DashboardGeometries.HEAD_UNIT_853X512)
+    fun dashboard_head_unit_rerouting_dark() =
+        capture("head-unit-853x512-rerouting-dark", darkTheme = true, uiState = DashboardFixtures.reroutingState)
+
     private fun capture(
         name: String,
         uiScale: UiScale = UiScale.MEDIUM,
         driverSide: DriverSide = DriverSide.RIGHT,
         darkTheme: Boolean = false,
+        uiState: HomeUiState = DashboardFixtures.state,
     ) {
         captureRoboImage(
             filePath = "src/test/screenshots/dashboard-$name.png",
@@ -143,7 +168,7 @@ class DashboardScreenshotTest {
             RobolectricHaze {
                 FemtoTheme(uiScale = uiScale, darkTheme = darkTheme) {
                     DashboardScaffold(
-                        uiState = DashboardFixtures.state,
+                        uiState = uiState,
                         is24Hour = true,
                         showClockSeconds = true,
                         speedUnit = SpeedUnit.KILOMETERS_PER_HOUR,

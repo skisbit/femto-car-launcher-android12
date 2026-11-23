@@ -6,6 +6,8 @@ import io.github.seijikohara.femto.data.common.download.RemoteFileFeed
 import io.github.seijikohara.femto.data.common.download.RevalidationResult
 import io.github.seijikohara.femto.data.common.download.TransferResult
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.RandomAccessFile
 
@@ -36,7 +38,9 @@ internal data class FakeDownloadStop(
  * [gateRestart], if one is set, and only then opens the part from its start, which truncates it, as the transport does
  * when it opens its output stream. The part then grows halfway to its end, which is reported; the download waits at
  * the gate of [gateDownload], if one is set; and the part grows to its end — the whole file, or the length of [stop] —
- * which is reported again. Lengths are set without writing bytes, so a part can stand for gigabytes.
+ * which is reported again. With [gateOutlivesCancel] set, the wait at that gate goes on after the caller is cancelled,
+ * so the second report comes after the cancel. Lengths are set without writing bytes, so a part can stand for
+ * gigabytes.
  */
 internal open class FakeRemoteFileFeed : RemoteFileFeed {
     val probeAnswers = mutableMapOf<String, ProbeResult>()
@@ -46,6 +50,12 @@ internal open class FakeRemoteFileFeed : RemoteFileFeed {
 
     var sentFile: RemoteFile? = null
     var stop: FakeDownloadStop? = null
+
+    /** How the download of one URL stops, ahead of [stop], so one file of several can fail. */
+    val stopsByUrl = mutableMapOf<String, FakeDownloadStop>()
+
+    /** Whether a download held at [gateDownload]'s gate outlives its caller's cancel, as a blocking read does. */
+    var gateOutlivesCancel: Boolean = false
 
     /** Every download, in call order. */
     val downloads = mutableListOf<RequestedFileDownload>()
@@ -63,11 +73,26 @@ internal open class FakeRemoteFileFeed : RemoteFileFeed {
         return probeAnswers[url] ?: ProbeResult.Unavailable
     }
 
-    // The stores that revalidate are tested against the real transport, so no test of this fake needs an answer.
+    /** What [revalidate] answers by URL; `Unavailable` for any other. */
+    val revalidateAnswers = mutableMapOf<String, RevalidationResult>()
+
+    /** Every revalidated URL, in call order. */
+    val revalidatedUrls = mutableListOf<String>()
+
+    // The stores' own revalidation is tested against the real transport; this answers the tests above them.
     override suspend fun revalidate(
         url: String,
         kept: RemoteFile,
-    ): RevalidationResult = RevalidationResult.Unavailable
+    ): RevalidationResult {
+        revalidatedUrls += url
+        revalidateGate?.await()
+        return revalidateAnswers[url] ?: RevalidationResult.Unavailable
+    }
+
+    private var revalidateGate: CompletableDeferred<Unit>? = null
+
+    /** Hold every [revalidate] until the gate opens, so a test can see what goes on while a check is out. */
+    fun gateRevalidate(): CompletableDeferred<Unit> = CompletableDeferred<Unit>().also { revalidateGate = it }
 
     override suspend fun download(
         url: String,
@@ -83,14 +108,14 @@ internal open class FakeRemoteFileFeed : RemoteFileFeed {
             if (!onRestart(file)) return TransferResult.Refused(file).also { part.delete() }
             restartGate?.await()
         }
-        val stop = stop
+        val stop = stopsByUrl[url] ?: stop
         val end = stop?.partBytes ?: file.sizeBytes
         if (stop != null && stop.partBytes == null) return stop.result.also { part.delete() }
         // The first write opens the part: from its start after a restart, after its bytes on a resume.
         val halfway = ((if (restarts) 0L else part.length()) + end) / 2
         part.resizeSparse(halfway)
         onProgress(halfway, file.sizeBytes)
-        downloadGate?.await()
+        if (gateOutlivesCancel) withContext(NonCancellable) { downloadGate?.await() } else downloadGate?.await()
         part.resizeSparse(end)
         onProgress(end, file.sizeBytes)
         return stop?.result ?: TransferResult.Complete(file)
