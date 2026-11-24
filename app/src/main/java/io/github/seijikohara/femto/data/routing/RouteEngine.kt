@@ -5,7 +5,9 @@ import java.io.File
 /** The offsets that keep the engine's micro-degrees positive, as BRouter stores a position. */
 private const val LONGITUDE_OFFSET_MICRODEGREES = 180_000_000
 private const val LATITUDE_OFFSET_MICRODEGREES = 90_000_000
-private const val MICRODEGREES_PER_DEGREE = 1_000_000.0
+
+/** BRouter's resolution: it stores and returns every position in whole micro-degrees. */
+internal const val MICRODEGREES_PER_DEGREE = 1_000_000.0
 
 private val MissingTileMessage = Regex("datafile (\\S+)\\.rd5 not found")
 
@@ -26,6 +28,13 @@ internal data class EngineRequest(
     val referenceIn: File? = null,
     /** Where the engine writes a found route as the reference for a later search to the same destination. */
     val referenceOut: File? = null,
+    /** The profile's parameters by name, overriding the profile's own values ([engineParameters]). */
+    val parameters: Map<String, String> = emptyMap(),
+    /**
+     * Which of BRouter's routes to return: 0 is the best one, and each later one steers away from the roads of the
+     * ones before it, which the engine computes again first.
+     */
+    val alternativeIndex: Int = 0,
 )
 
 /** A position as the engine stores it: micro-degrees offset by +180° (longitude) and +90° (latitude). */

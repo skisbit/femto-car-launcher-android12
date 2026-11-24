@@ -16,6 +16,8 @@ import io.github.seijikohara.femto.data.calendar.DayCell
 import io.github.seijikohara.femto.data.calendar.EventItem
 import io.github.seijikohara.femto.data.location.VehicleMotion
 import io.github.seijikohara.femto.data.places.PlaceTarget
+import io.github.seijikohara.femto.data.places.SavedPlace
+import io.github.seijikohara.femto.data.routing.RouteConditions
 import io.github.seijikohara.femto.data.voice.VoiceState
 import io.github.seijikohara.femto.testfixtures.ScreenshotCompareOptions
 import io.github.seijikohara.femto.testfixtures.fakeCalendarSnapshot
@@ -24,6 +26,7 @@ import io.github.seijikohara.femto.testfixtures.fakeWeatherSnapshot
 import io.github.seijikohara.femto.ui.destination.DestinationPanel
 import io.github.seijikohara.femto.ui.destination.DestinationUiState
 import io.github.seijikohara.femto.ui.destination.LastFix
+import io.github.seijikohara.femto.ui.destination.RenameDraft
 import io.github.seijikohara.femto.ui.destination.RouteStep
 import io.github.seijikohara.femto.ui.drawer.AppDrawerUiState
 import io.github.seijikohara.femto.ui.drawer.AppsPanel
@@ -159,13 +162,16 @@ class PanelScreenshotTest {
         capture("apps-panel-head-unit-853x512-dark", darkTheme = true) { AppsPanelSample() }
 
     // Destination panel with route preview (issue #389 phase 3, nightly builds
-    // only): Route beside Navigate and on each saved place, then the download
-    // confirmation that takes the panel's body over. The tests run the stable
-    // build, where routing is off, so the state turns it on explicitly.
+    // only): Show route under Open in maps app and on each saved place, the route condition
+    // chips under it (one on), then the download confirmation that takes the
+    // panel's body over. The tests run the stable build, where routing is off,
+    // so the state turns it on explicitly.
     @Test
     @Config(qualifiers = "w853dp-h512dp-mdpi")
     fun destination_panel_route_head_unit() =
-        capture("destination-panel-head-unit-853x512-route") { DestinationPanelSample(RouteStep.Idle) }
+        capture("destination-panel-head-unit-853x512-route") {
+            DestinationPanelSample(RouteStep.Idle, conditions = RouteConditions(avoidTolls = true))
+        }
 
     @Test
     @Config(qualifiers = "w853dp-h512dp-mdpi")
@@ -175,7 +181,7 @@ class PanelScreenshotTest {
         }
 
     // The panel a long press on the map opens: the picked point in place of
-    // the search, with Navigate and Route.
+    // the search, with Open in maps app and Show route.
     @Test
     @Config(qualifiers = "w853dp-h512dp-mdpi")
     fun destination_panel_map_point_head_unit() =
@@ -183,30 +189,57 @@ class PanelScreenshotTest {
             DestinationPanelSample(RouteStep.Idle, pickedPoint = PlaceTarget.Point(35.658581, 139.745433))
         }
 
+    // Saved places the driver named: a typed place and a saved point carry a name over the line that says what they
+    // were saved as, next to one that was never named, each row with its route, rename and delete buttons.
+    @Test
+    @Config(qualifiers = "w853dp-h512dp-mdpi")
+    fun destination_panel_named_places_head_unit() =
+        capture("destination-panel-head-unit-853x512-named-places") {
+            DestinationPanelSample(RouteStep.Idle, places = NamedPlaces)
+        }
+
+    // The row of the place being renamed turns into a name field with Save and Cancel; the other rows stay. A named
+    // place starts with its name selected; an unnamed one (the dark capture) with an empty field that shows what it
+    // was saved as.
+    @Test
+    @Config(qualifiers = "w853dp-h512dp-mdpi")
+    fun destination_panel_rename_head_unit() =
+        capture("destination-panel-head-unit-853x512-rename") {
+            DestinationPanelSample(
+                RouteStep.Idle,
+                places = NamedPlaces,
+                renaming = RenameDraft(id = 1L, text = "Office"),
+            )
+        }
+
+    @Test
+    @Config(qualifiers = "w853dp-h512dp-mdpi")
+    fun destination_panel_rename_head_unit_dark() =
+        capture("destination-panel-head-unit-853x512-rename-dark", darkTheme = true) {
+            DestinationPanelSample(RouteStep.Idle, places = NamedPlaces, renaming = RenameDraft(id = 3L, text = ""))
+        }
+
     @Composable
     private fun DestinationPanelSample(
         route: RouteStep,
         pickedPoint: PlaceTarget.Point? = null,
+        conditions: RouteConditions = RouteConditions(),
+        places: List<SavedPlace> = DefaultPlaces,
+        renaming: RenameDraft? = null,
     ) {
         DestinationPanel(
             uiState =
                 DestinationUiState(
                     query = "Central Station",
                     voice = VoiceState.Idle,
-                    places =
-                        listOf(
-                            fakeSavedPlace(
-                                id = 1L,
-                                label = "Office",
-                                target = PlaceTarget.Query("1st & Pike, Seattle"),
-                            ),
-                            fakeSavedPlace(id = 2L, label = "Home", target = PlaceTarget.Point(35.681236, 139.767125)),
-                        ),
+                    places = places,
                     motion = VehicleMotion.PARKED,
                     routeAvailable = true,
                     geocoderAvailable = true,
                     route = route,
                     pickedPoint = pickedPoint,
+                    conditions = conditions,
+                    renaming = renaming,
                 ),
             lastFix = LastFix(PlaceTarget.Point(35.681236, 139.767125), elapsedRealtimeNanos = 0L),
             currentAddress = "1-9-1 Marunouchi",
@@ -254,6 +287,30 @@ class PanelScreenshotTest {
     }
 
     private companion object {
+        val DefaultPlaces =
+            listOf(
+                fakeSavedPlace(id = 1L, label = "Office", target = PlaceTarget.Query("1st & Pike, Seattle")),
+                fakeSavedPlace(id = 2L, label = "Home", target = PlaceTarget.Point(35.681236, 139.767125)),
+            )
+
+        // A named typed place, a named point saved under its address, and a point never named.
+        val NamedPlaces =
+            listOf(
+                fakeSavedPlace(
+                    id = 1L,
+                    label = "1st & Pike, Seattle",
+                    target = PlaceTarget.Query("1st & Pike, Seattle"),
+                    name = "Office",
+                ),
+                fakeSavedPlace(
+                    id = 2L,
+                    label = "1-9-1 Marunouchi",
+                    target = PlaceTarget.Point(35.681236, 139.767125),
+                    name = "Home",
+                ),
+                fakeSavedPlace(id = 3L, label = "35.65858, 139.74543", target = PlaceTarget.Point(35.65858, 139.74543)),
+            )
+
         // Two calendars with provider colours, so multipleCalendarsVisible opens the
         // colour-bar path. The default fixture leaves the bar off (one calendar, no
         // colours), which would have made a "colour bar" golden prove nothing.

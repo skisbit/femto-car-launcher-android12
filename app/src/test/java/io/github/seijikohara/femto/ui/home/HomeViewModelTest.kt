@@ -4,10 +4,13 @@ import android.content.ComponentName
 import android.content.Intent
 import android.location.Location
 import android.location.LocationManager
+import android.os.SystemClock
+import androidx.lifecycle.viewModelScope
 import app.cash.turbine.test
 import io.github.seijikohara.femto.data.common.UI_SUBSCRIPTION_GRACE_MS
 import io.github.seijikohara.femto.data.dock.DockNavId
 import io.github.seijikohara.femto.data.dock.DockStatusId
+import io.github.seijikohara.femto.data.location.MAX_GAP_SECONDS
 import io.github.seijikohara.femto.data.location.MIN_MOVING_SPEED_MS
 import io.github.seijikohara.femto.data.location.TripState
 import io.github.seijikohara.femto.data.music.MusicCardState
@@ -17,6 +20,7 @@ import io.github.seijikohara.femto.data.places.PlaceTarget
 import io.github.seijikohara.femto.data.routing.ActiveRoute
 import io.github.seijikohara.femto.data.routing.RerouteStatus
 import io.github.seijikohara.femto.data.routing.Route
+import io.github.seijikohara.femto.data.routing.RouteCandidate
 import io.github.seijikohara.femto.data.routing.RouteFix
 import io.github.seijikohara.femto.data.routing.RoutePoint
 import io.github.seijikohara.femto.data.routing.RouteProgress
@@ -25,23 +29,28 @@ import io.github.seijikohara.femto.data.update.UpdateManifest
 import io.github.seijikohara.femto.data.update.UpdateSettings
 import io.github.seijikohara.femto.data.update.UpdateState
 import io.github.seijikohara.femto.data.weather.WeatherSnapshot
+import io.github.seijikohara.femto.testfixtures.FAKE_MUSIC_PACKAGE
 import io.github.seijikohara.femto.testfixtures.FakeUpdateSettingsStore
 import io.github.seijikohara.femto.testfixtures.fakeAddress
 import io.github.seijikohara.femto.testfixtures.fakeCalendarSnapshot
 import io.github.seijikohara.femto.testfixtures.fakeEquatorRoute
+import io.github.seijikohara.femto.testfixtures.fakeLastPlayedState
 import io.github.seijikohara.femto.testfixtures.fakeLocation
 import io.github.seijikohara.femto.testfixtures.fakeNowPlaying
 import io.github.seijikohara.femto.testfixtures.fakeOutAndBackRoute
+import io.github.seijikohara.femto.testfixtures.fakeParallelRoadsRoute
 import io.github.seijikohara.femto.testfixtures.fakeRouteFix
 import io.github.seijikohara.femto.testfixtures.fakeSystemStatus
 import io.github.seijikohara.femto.testfixtures.fakeTripState
 import io.github.seijikohara.femto.testfixtures.fakeUpdateManifest
 import io.github.seijikohara.femto.testfixtures.fakeWeatherSnapshot
 import io.github.seijikohara.femto.ui.home.components.AppsBarShortcut
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -487,6 +496,208 @@ class HomeViewModelTest {
             // tap — there is no callback confirming whether the media key alone
             // resumed a session, so the launch always happens too.
             assertEquals(1, resumeCount)
+        }
+
+    // --- The last played track ---------------------------------------------------
+
+    @Test
+    fun `a tap on the last played track resumes it in its app`() =
+        runTest {
+            val resumed = mutableListOf<String>()
+            val viewModel =
+                resumeViewModel {
+                    resumed += it
+                    false
+                }
+
+            viewModel.onAction(HomeAction.ResumeLastPlayed(FAKE_MUSIC_PACKAGE))
+            runCurrent()
+
+            assertEquals(listOf(FAKE_MUSIC_PACKAGE), resumed)
+        }
+
+    @Test
+    fun `a second tap while an attempt runs does nothing`() =
+        runTest {
+            var attempts = 0
+            val viewModel =
+                resumeViewModel {
+                    attempts++
+                    awaitCancellation()
+                }
+
+            repeat(2) { viewModel.onAction(HomeAction.ResumeLastPlayed(FAKE_MUSIC_PACKAGE)) }
+            runCurrent()
+
+            assertEquals(1, attempts)
+        }
+
+    @Test
+    fun `the card shows a running attempt as resuming`() =
+        runTest {
+            val viewModel = resumeViewModel { awaitCancellation() }
+
+            viewModel.onAction(HomeAction.ResumeLastPlayed(FAKE_MUSIC_PACKAGE))
+            runCurrent()
+
+            assertEquals(fakeLastPlayedState(resuming = true), viewModel.uiState.value.musicState)
+        }
+
+    @Test
+    fun `the card is usable again once an attempt ends without playback`() =
+        runTest {
+            val attemptDone = CompletableDeferred<Boolean>()
+            var attempts = 0
+            val viewModel =
+                resumeViewModel {
+                    attempts++
+                    attemptDone.await()
+                }
+            viewModel.onAction(HomeAction.ResumeLastPlayed(FAKE_MUSIC_PACKAGE))
+            runCurrent()
+
+            attemptDone.complete(false)
+            runCurrent()
+            assertEquals(fakeLastPlayedState(), viewModel.uiState.value.musicState)
+
+            viewModel.onAction(HomeAction.ResumeLastPlayed(FAKE_MUSIC_PACKAGE))
+            runCurrent()
+            assertEquals(2, attempts)
+        }
+
+    @Test
+    fun `after playback starts the button stays pending until the card leaves the track`() =
+        runTest {
+            // The attempt sees the app play before the card's own state arrives.
+            val music = MutableStateFlow<MusicCardState>(fakeLastPlayedState())
+            var attempts = 0
+            val viewModel =
+                resumeViewModel(musicStateFlow = music) {
+                    attempts++
+                    true
+                }
+            viewModel.onAction(HomeAction.ResumeLastPlayed(FAKE_MUSIC_PACKAGE))
+            runCurrent()
+
+            viewModel.onAction(HomeAction.ResumeLastPlayed(FAKE_MUSIC_PACKAGE))
+            runCurrent()
+            assertEquals(fakeLastPlayedState(resuming = true), viewModel.uiState.value.musicState)
+            assertEquals(1, attempts)
+
+            music.value = MusicCardState.Playing(fakeNowPlaying())
+            runCurrent()
+            // The live session ends and the track is offered again: the button is free.
+            music.value = fakeLastPlayedState()
+            runCurrent()
+            assertEquals(fakeLastPlayedState(), viewModel.uiState.value.musicState)
+        }
+
+    @Test
+    fun `a card that never hears of the playback frees the button after the grace`() =
+        runTest {
+            val viewModel = resumeViewModel { true }
+            viewModel.onAction(HomeAction.ResumeLastPlayed(FAKE_MUSIC_PACKAGE))
+            runCurrent()
+
+            advanceTimeBy(RESUME_SETTLE_GRACE_MS - 1)
+            runCurrent()
+            assertEquals(fakeLastPlayedState(resuming = true), viewModel.uiState.value.musicState)
+
+            advanceTimeBy(2)
+            runCurrent()
+            assertEquals(fakeLastPlayedState(), viewModel.uiState.value.musicState)
+        }
+
+    @Test
+    fun `waiting for the card after playback starts subscribes to no dashboard source`() =
+        runTest {
+            // The driver taps, then leaves the dashboard while the app buffers;
+            // the app plays once the dashboard's sources have stopped. Waiting
+            // on uiState would subscribe to it and start every source again.
+            var calendarCollections = 0
+            val attemptPlays = CompletableDeferred<Boolean>()
+            val viewModel =
+                HomeViewModel(
+                    locationFlow = flowOf(fakeLocation()),
+                    addressFlow = flowOf(fakeAddress()),
+                    weatherFlow = flowOf(fakeWeatherSnapshot()),
+                    musicStateFlow = flowOf(fakeLastPlayedState()),
+                    calendarFlow =
+                        flow {
+                            calendarCollections++
+                            emit(fakeCalendarSnapshot())
+                        },
+                    systemStatusFlow = flowOf(fakeSystemStatus()),
+                    tripStateFlow = flowOf(fakeTripState()),
+                    resumeLastPlayed = { attemptPlays.await() },
+                )
+            val dashboard = backgroundScope.launch { viewModel.uiState.collect { } }
+            runCurrent()
+            viewModel.onAction(HomeAction.ResumeLastPlayed(FAKE_MUSIC_PACKAGE))
+            runCurrent()
+
+            dashboard.cancel()
+            advanceTimeBy(UI_SUBSCRIPTION_GRACE_MS + 1)
+            attemptPlays.complete(true)
+            advanceTimeBy(RESUME_SETTLE_GRACE_MS + 1)
+            runCurrent()
+
+            assertEquals(1, calendarCollections)
+        }
+
+    @Test
+    fun `a tap that lands after a live session took the card starts nothing`() =
+        runTest {
+            var attempts = 0
+            val viewModel =
+                resumeViewModel(musicStateFlow = flowOf(MusicCardState.Playing(fakeNowPlaying()))) {
+                    attempts++
+                    false
+                }
+
+            viewModel.onAction(HomeAction.ResumeLastPlayed(FAKE_MUSIC_PACKAGE))
+            runCurrent()
+
+            assertEquals(0, attempts)
+        }
+
+    @Test
+    fun `a tap naming an app the card does not offer starts nothing`() =
+        runTest {
+            var attempts = 0
+            val viewModel =
+                resumeViewModel {
+                    attempts++
+                    false
+                }
+
+            viewModel.onAction(HomeAction.ResumeLastPlayed("com.example.other"))
+            runCurrent()
+
+            assertEquals(0, attempts)
+        }
+
+    @Test
+    fun `clearing the dashboard cancels a running attempt`() =
+        runTest {
+            var cancelled = false
+            val viewModel =
+                resumeViewModel {
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        cancelled = true
+                    }
+                }
+            viewModel.onAction(HomeAction.ResumeLastPlayed(FAKE_MUSIC_PACKAGE))
+            runCurrent()
+
+            // What onCleared does: the attempt runs in viewModelScope, which
+            // closes with the ViewModel.
+            viewModel.viewModelScope.cancel()
+            runCurrent()
+
+            assertTrue(cancelled)
         }
 
     @Test
@@ -1040,6 +1251,23 @@ class HomeViewModelTest {
             spectrumBandsFor = { active -> active.map { if (it) bands else null } },
         )
 
+    // Every source emits, so the card holds [musicState]; subscribed the way the
+    // dashboard is, so the action reads the card on screen.
+    private fun TestScope.resumeViewModel(
+        musicStateFlow: Flow<MusicCardState> = flowOf(fakeLastPlayedState()),
+        resume: suspend (String) -> Boolean,
+    ): HomeViewModel =
+        HomeViewModel(
+            locationFlow = flowOf(fakeLocation()),
+            addressFlow = flowOf(fakeAddress()),
+            weatherFlow = flowOf(fakeWeatherSnapshot()),
+            musicStateFlow = musicStateFlow,
+            calendarFlow = flowOf(fakeCalendarSnapshot()),
+            systemStatusFlow = flowOf(fakeSystemStatus()),
+            tripStateFlow = flowOf(fakeTripState()),
+            resumeLastPlayed = resume,
+        ).also { settledState(it) }
+
     private suspend fun HomeViewModel.assertEvent(
         action: HomeAction,
         expected: HomeEvent,
@@ -1246,6 +1474,229 @@ class HomeViewModelTest {
             assertEquals(emptyList(), left)
         }
 
+    // --- The route kept across a restart ---------------------------------------
+
+    // The keeper's first-fix decision must run with nothing on the map too.
+    @Test
+    fun `each live GPS fix's time reaches the route keeper, with no route on the map`() =
+        runTest {
+            val times = mutableListOf<Long>()
+            val viewModel =
+                routeViewModel(
+                    location =
+                        fakeLocation(
+                            provider = LocationManager.GPS_PROVIDER,
+                            timeMs = GPS_TIME_MS,
+                            elapsedRealtimeNanos = BADGE_NOW,
+                        ),
+                    available = true,
+                    activeRouteFlow = flowOf(null),
+                    onGpsFix = { times += it },
+                    nowElapsedRealtimeNanos = { BADGE_NOW },
+                )
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { viewModel.uiState.collect {} }
+
+            assertEquals(listOf(GPS_TIME_MS), times)
+        }
+
+    // As the trip meter takes fixes: a network position, or the cached seed a subscription replays, says nothing about
+    // when the vehicle was last driven.
+    @Test
+    fun `a network fix and a stale seed never reach the route keeper`() =
+        runTest {
+            val location = MutableStateFlow<Location?>(null)
+            val times = mutableListOf<Long>()
+            val viewModel =
+                routeViewModel(
+                    locationFlow = location,
+                    available = true,
+                    onGpsFix = { times += it },
+                    nowElapsedRealtimeNanos = { BADGE_NOW },
+                )
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { viewModel.uiState.collect {} }
+
+            location.value =
+                fakeLocation(
+                    provider = LocationManager.NETWORK_PROVIDER,
+                    timeMs = GPS_TIME_MS,
+                    elapsedRealtimeNanos = BADGE_NOW,
+                )
+            location.value =
+                fakeLocation(
+                    provider = LocationManager.GPS_PROVIDER,
+                    timeMs = GPS_TIME_MS + 1,
+                    elapsedRealtimeNanos = BADGE_NOW - STALE_SEED_AGE_NANOS,
+                )
+            location.value =
+                fakeLocation(
+                    provider = LocationManager.GPS_PROVIDER,
+                    timeMs = GPS_TIME_MS + 2,
+                    elapsedRealtimeNanos = BADGE_NOW,
+                )
+
+            assertEquals(listOf(GPS_TIME_MS + 2), times)
+        }
+
+    // --- Route choice card (issue #389 phase 3) -------------------------------
+
+    @Test
+    fun `the choice shows the session's candidates and selection`() =
+        runTest {
+            val viewModel = routeViewModel(available = true, activeRouteFlow = flowOf(choosingRoute()))
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { viewModel.uiState.collect {} }
+
+            val route = assertNotNull(viewModel.uiState.value.activeRoute)
+            assertEquals(
+                RouteChoiceState(
+                    session = SESSION,
+                    candidates =
+                        listOf(
+                            CandidateSummary(distanceMeters = 22_000, durationSeconds = 1_200),
+                            CandidateSummary(distanceMeters = 22_461, durationSeconds = 1_200),
+                        ),
+                    selected = 1,
+                    finding = true,
+                    searchCompleted = false,
+                ),
+                route.choice,
+            )
+            assertEquals(PARALLEL_ROUTE.points, route.line, "the selected candidate is the route followed")
+            assertEquals(listOf(EQUATOR_ROUTE.points), route.alternativeLines, "the other candidate is drawn thin")
+        }
+
+    @Test
+    fun `the card says no other route only after a search that ran to its end`() =
+        runTest {
+            val alone = choosingRoute().copy(route = EQUATOR_ROUTE, candidates = choosingRoute().candidates.take(1))
+            val active = MutableStateFlow<ActiveRoute?>(alone.copy(selected = 0, finding = false))
+            val viewModel = routeViewModel(available = true, activeRouteFlow = active)
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { viewModel.uiState.collect {} }
+            val afterAStop = viewModel.uiState.value.activeRoute
+                ?.choice
+                ?.noOtherRoute
+
+            active.value = active.value?.copy(searchCompleted = true)
+
+            assertEquals(
+                false to true,
+                afterAStop to
+                    viewModel.uiState.value.activeRoute
+                        ?.choice
+                        ?.noOtherRoute,
+            )
+        }
+
+    @Test
+    fun `a closed choice shows no card and no other lines`() =
+        runTest {
+            val closed = choosingRoute().copy(choosing = false, finding = false)
+            val viewModel = routeViewModel(available = true, activeRouteFlow = flowOf(closed))
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { viewModel.uiState.collect {} }
+
+            val route = assertNotNull(viewModel.uiState.value.activeRoute)
+            assertEquals(null to emptyList(), route.choice to route.alternativeLines)
+        }
+
+    @Test
+    fun `selecting a candidate dispatches to the store`() =
+        runTest {
+            val selections = mutableListOf<Pair<Long, Int>>()
+            val viewModel =
+                routeViewModel(
+                    available = true,
+                    activeRouteFlow = flowOf(choosingRoute()),
+                    selectRouteCandidate = { session, index -> selections += session to index },
+                )
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { viewModel.uiState.collect {} }
+
+            viewModel.onAction(HomeAction.SelectRouteCandidate(0))
+
+            assertEquals(listOf(SESSION to 0), selections)
+        }
+
+    @Test
+    fun `Done on the card dispatches the close to the store`() =
+        runTest {
+            val closes = mutableListOf<Long>()
+            val viewModel =
+                routeViewModel(
+                    available = true,
+                    activeRouteFlow = flowOf(choosingRoute()),
+                    closeRouteChoice = { closes += it },
+                )
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { viewModel.uiState.collect {} }
+
+            viewModel.onAction(HomeAction.CloseRouteChoice)
+
+            assertEquals(listOf(SESSION), closes)
+        }
+
+    @Test
+    fun `the choice closes after 30 s of driving`() =
+        runTest {
+            val closes = mutableListOf<Long>()
+            val viewModel =
+                routeViewModel(
+                    location = liveGpsFix(),
+                    available = true,
+                    activeRouteFlow = flowOf(choosingRoute()),
+                    tripStateFlow = flowOf(fakeTripState(currentSpeedMs = MIN_MOVING_SPEED_MS + 10.0)),
+                    closeRouteChoice = { closes += it },
+                )
+            backgroundScope.launch { viewModel.uiState.collect {} }
+
+            at(ROUTE_CHOICE_DRIVING_CLOSE_MS - 1)
+            val beforeTheEnd = closes.toList()
+            at(ROUTE_CHOICE_DRIVING_CLOSE_MS)
+
+            assertEquals(emptyList<Long>() to listOf(SESSION), beforeTheEnd to closes)
+        }
+
+    @Test
+    fun `a stop resets the driving count`() =
+        runTest {
+            val closes = mutableListOf<Long>()
+            val trip = MutableStateFlow(fakeTripState(currentSpeedMs = MIN_MOVING_SPEED_MS + 10.0))
+            val viewModel =
+                routeViewModel(
+                    location = liveGpsFix(),
+                    available = true,
+                    activeRouteFlow = flowOf(choosingRoute()),
+                    tripStateFlow = trip,
+                    closeRouteChoice = { closes += it },
+                )
+            backgroundScope.launch { viewModel.uiState.collect {} }
+            at(20_000L)
+
+            // A stop at a light, then driving on: the 30 s count starts again.
+            trip.value = fakeTripState(currentSpeedMs = 0.0)
+            at(25_000L)
+            trip.value = fakeTripState(currentSpeedMs = MIN_MOVING_SPEED_MS + 10.0)
+            at(25_000L + ROUTE_CHOICE_DRIVING_CLOSE_MS - 1)
+            val beforeTheEnd = closes.toList()
+            at(25_000L + ROUTE_CHOICE_DRIVING_CLOSE_MS)
+
+            assertEquals(emptyList<Long>() to listOf(SESSION), beforeTheEnd to closes)
+        }
+
+    // The session while the driver chooses: the equator route found first, the parallel roads second and selected,
+    // and a third being searched for.
+    private fun choosingRoute(): ActiveRoute =
+        ActiveRoute(
+            session = SESSION,
+            route = PARALLEL_ROUTE,
+            destination = ROUTE_DESTINATION,
+            reference = null,
+            candidates =
+                listOf(
+                    RouteCandidate(EQUATOR_ROUTE, reference = null, computingMs = 500L),
+                    RouteCandidate(PARALLEL_ROUTE, reference = null, computingMs = 900L),
+                ),
+            selected = 1,
+            choosing = true,
+            finding = true,
+        )
+
     // On the equator route at 0 s, then about 110 m north of it, moving east, a fix a second until the watch decides
     // at 6 s that the vehicle has left the route.
     private fun leaveTheRoute(
@@ -1291,6 +1742,11 @@ class HomeViewModelTest {
         onLeftRoute: (Long, RouteFix) -> Unit = { _, _ -> },
         onBackOnRoute: (Long) -> Unit = {},
         tripState: TripState = fakeTripState(),
+        tripStateFlow: Flow<TripState> = flowOf(tripState),
+        selectRouteCandidate: (Long, Int) -> Unit = { _, _ -> },
+        closeRouteChoice: (Long) -> Unit = {},
+        onGpsFix: (Long) -> Unit = {},
+        nowElapsedRealtimeNanos: () -> Long = SystemClock::elapsedRealtimeNanos,
     ): HomeViewModel =
         HomeViewModel(
             locationFlow = locationFlow,
@@ -1299,13 +1755,17 @@ class HomeViewModelTest {
             musicStateFlow = flowOf(MusicCardState.NeedsPermission),
             calendarFlow = flowOf(null),
             systemStatusFlow = flowOf(fakeSystemStatus()),
-            tripStateFlow = flowOf(tripState),
+            tripStateFlow = tripStateFlow,
             activeRouteFlow = activeRouteFlow,
             routingAvailable = flowOf(available),
             clearRoute = clearRoute,
             onLeftRoute = onLeftRoute,
             onBackOnRoute = onBackOnRoute,
+            selectRouteCandidate = selectRouteCandidate,
+            closeRouteChoice = closeRouteChoice,
             routeDispatcher = UnconfinedTestDispatcher(testScheduler),
+            onGpsFix = onGpsFix,
+            nowElapsedRealtimeNanos = nowElapsedRealtimeNanos,
         )
 
     private fun stubViewModel(
@@ -1334,6 +1794,9 @@ class HomeViewModelTest {
         // The fix at 0.1° east is halfway along it.
         val EQUATOR_ROUTE = fakeEquatorRoute()
 
+        // The second route on the choice card.
+        val PARALLEL_ROUTE = fakeParallelRoadsRoute()
+
         // The session the destination panel opened for the route under test, and where the route goes.
         const val SESSION = 7L
         val ROUTE_DESTINATION = RoutePoint(latitude = 0.0, longitude = 0.2)
@@ -1353,5 +1816,11 @@ class HomeViewModelTest {
 
         // A minute old: a cached seed from before this subscription.
         const val STALE_FIX_AGE_NANOS = 60_000_000_000L
+
+        // Past the trip meter's gap window: a seed the trip meter, and so the route keeper, never takes.
+        val STALE_SEED_AGE_NANOS = ((MAX_GAP_SECONDS + 1) * 1_000_000_000).toLong()
+
+        // A GPS fix's own time: 2026-11-22T09:00:00Z.
+        const val GPS_TIME_MS = 1_795_338_000_000L
     }
 }

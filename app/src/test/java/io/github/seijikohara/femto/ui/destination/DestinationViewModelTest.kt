@@ -5,6 +5,7 @@ import io.github.seijikohara.femto.data.geocoding.PlaceLookup
 import io.github.seijikohara.femto.data.location.CurrentFix
 import io.github.seijikohara.femto.data.location.LOCATION_STALE_THRESHOLD_MS
 import io.github.seijikohara.femto.data.location.VehicleMotion
+import io.github.seijikohara.femto.data.places.MAX_PLACE_NAME_LENGTH
 import io.github.seijikohara.femto.data.places.PlaceTarget
 import io.github.seijikohara.femto.data.places.SavedPlace
 import io.github.seijikohara.femto.data.routing.ActiveRouteStore
@@ -12,11 +13,13 @@ import io.github.seijikohara.femto.data.routing.EngineOutcome
 import io.github.seijikohara.femto.data.routing.REFERENCE_PRUNE_GRACE_MS
 import io.github.seijikohara.femto.data.routing.ROUTING_TILE_CHECK_INTERVAL_MS
 import io.github.seijikohara.femto.data.routing.RerouteStatus
+import io.github.seijikohara.femto.data.routing.RouteConditions
 import io.github.seijikohara.femto.data.routing.RoutePoint
 import io.github.seijikohara.femto.data.voice.VoiceState
 import io.github.seijikohara.femto.testfixtures.FakeCurrentFixSource
 import io.github.seijikohara.femto.testfixtures.FakeDownloadStop
 import io.github.seijikohara.femto.testfixtures.FakePlaceLocator
+import io.github.seijikohara.femto.testfixtures.FakeRouteConditionsStore
 import io.github.seijikohara.femto.testfixtures.FakeSavedPlacesStore
 import io.github.seijikohara.femto.testfixtures.FakeSpeechInput
 import io.github.seijikohara.femto.testfixtures.HeldDispatcher
@@ -77,6 +80,13 @@ class DestinationViewModelTest {
     // How often a route run has stopped the rerouter.
     private var rerouteCancels = 0
 
+    // The candidate searches a found route started (its session and origin), and how often a route run stopped one.
+    private val candidateStarts = mutableListOf<Pair<Long, RoutePoint>>()
+    private var candidateCancels = 0
+
+    // The route conditions kept on the device, as the last subscribedViewModel holds them.
+    private var routeConditions = FakeRouteConditionsStore()
+
     @Before
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
@@ -97,6 +107,7 @@ class DestinationViewModelTest {
         routingAvailable: Boolean = false,
         placeLocator: FakePlaceLocator = FakePlaceLocator(),
         ioDispatcher: CoroutineDispatcher = StandardTestDispatcher(testScheduler),
+        conditions: RouteConditions = RouteConditions(),
     ): DestinationViewModel {
         routing = RoutingFixture(tempFolder.root, StandardTestDispatcher(testScheduler))
         return DestinationViewModel(
@@ -109,12 +120,15 @@ class DestinationViewModelTest {
             planner = routing.planner(),
             tiles = routing.tiles,
             activeRoute = activeRoute,
+            conditionsStore = FakeRouteConditionsStore(conditions).also { routeConditions = it },
             nowElapsedRealtimeNanos = { nowNanos },
             hasLocationPermission = { locationGranted },
             currentFix = currentFix,
             nowEpochMs = { routing.nowEpochMs },
             cancelReroute = { rerouteCancels++ },
             ioDispatcher = ioDispatcher,
+            startCandidates = { session, origin -> candidateStarts += session to origin },
+            cancelCandidates = { candidateCancels++ },
         ).also { viewModel ->
             backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { viewModel.uiState.collect {} }
         }
@@ -303,6 +317,183 @@ class DestinationViewModelTest {
             val viewModel = subscribedViewModel(saved = listOf(place))
             viewModel.onAction(DestinationAction.DeletePlace(place.id))
             assertEquals(listOf(place), viewModel.uiState.value.places)
+        }
+
+    @Test
+    fun rename_of_an_unnamed_place_starts_empty_and_of_a_named_place_with_its_name() =
+        runTest {
+            val unnamed = fakeSavedPlace(id = 1L, label = "Office")
+            val named = fakeSavedPlace(id = 2L, label = "1-9-1 Marunouchi", name = "Home")
+            val viewModel = subscribedViewModel(saved = listOf(unnamed, named))
+
+            viewModel.onAction(DestinationAction.StartRename(unnamed.id))
+            assertEquals(RenameDraft(unnamed.id, ""), viewModel.uiState.value.renaming)
+
+            viewModel.onAction(DestinationAction.StartRename(named.id))
+            assertEquals(RenameDraft(named.id, "Home"), viewModel.uiState.value.renaming)
+        }
+
+    // The label is past the name cap: a draft made of it would be saved cut, as a name, by a Save with no edit.
+    @Test
+    fun saving_an_unnamed_place_with_a_long_label_without_typing_stores_no_name() =
+        runTest {
+            val place = fakeSavedPlace(id = 1L, label = "a".repeat(MAX_PLACE_NAME_LENGTH + 40))
+            val viewModel = subscribedViewModel(saved = listOf(place))
+            viewModel.onAction(DestinationAction.StartRename(place.id))
+
+            viewModel.onAction(DestinationAction.SaveRename)
+
+            assertEquals(listOf(place), store.current)
+        }
+
+    @Test
+    fun saving_a_named_place_with_an_empty_field_takes_its_name_away() =
+        runTest {
+            val place = fakeSavedPlace(id = 1L, label = "Office", name = "Work")
+            val viewModel = subscribedViewModel(saved = listOf(place))
+            viewModel.onAction(DestinationAction.StartRename(place.id))
+            viewModel.onAction(DestinationAction.RenameChanged(""))
+
+            viewModel.onAction(DestinationAction.SaveRename)
+
+            assertNull(store.current.single().name)
+        }
+
+    @Test
+    fun rename_of_a_place_that_is_not_there_does_not_start() =
+        runTest {
+            val viewModel = subscribedViewModel(saved = listOf(fakeSavedPlace(id = 1L)))
+
+            viewModel.onAction(DestinationAction.StartRename(99L))
+
+            assertNull(viewModel.uiState.value.renaming)
+        }
+
+    @Test
+    fun saving_stores_the_trimmed_name_and_closes_the_field() =
+        runTest {
+            val place = fakeSavedPlace(id = 1L, label = "Office")
+            val viewModel = subscribedViewModel(saved = listOf(place))
+            viewModel.onAction(DestinationAction.StartRename(place.id))
+            viewModel.onAction(DestinationAction.RenameChanged("  Work  "))
+
+            viewModel.onAction(DestinationAction.SaveRename)
+
+            assertEquals("Work", store.current.single().name)
+            assertEquals(
+                "Work",
+                viewModel.uiState.value.places
+                    .single()
+                    .name,
+            )
+            assertNull(viewModel.uiState.value.renaming)
+        }
+
+    @Test
+    fun saving_a_blank_name_takes_the_name_away() =
+        runTest {
+            val place = fakeSavedPlace(id = 1L, label = "Office", name = "Work")
+            val viewModel = subscribedViewModel(saved = listOf(place))
+            viewModel.onAction(DestinationAction.StartRename(place.id))
+            viewModel.onAction(DestinationAction.RenameChanged("   "))
+
+            viewModel.onAction(DestinationAction.SaveRename)
+
+            assertNull(store.current.single().name)
+        }
+
+    @Test
+    fun the_typed_name_is_cut_to_the_cap() =
+        runTest {
+            val place = fakeSavedPlace(id = 1L)
+            val viewModel = subscribedViewModel(saved = listOf(place))
+            viewModel.onAction(DestinationAction.StartRename(place.id))
+
+            viewModel.onAction(DestinationAction.RenameChanged("a".repeat(MAX_PLACE_NAME_LENGTH + 20)))
+
+            assertEquals(
+                MAX_PLACE_NAME_LENGTH,
+                viewModel.uiState.value.renaming
+                    ?.text
+                    ?.length,
+            )
+        }
+
+    @Test
+    fun cancel_stores_nothing() =
+        runTest {
+            val place = fakeSavedPlace(id = 1L, label = "Office")
+            val viewModel = subscribedViewModel(saved = listOf(place))
+            viewModel.onAction(DestinationAction.StartRename(place.id))
+            viewModel.onAction(DestinationAction.RenameChanged("Work"))
+
+            viewModel.onAction(DestinationAction.CancelRename)
+
+            assertEquals(listOf(place), store.current)
+            assertNull(viewModel.uiState.value.renaming)
+        }
+
+    @Test
+    fun starting_to_move_closes_the_rename_without_saving() =
+        runTest {
+            val place = fakeSavedPlace(id = 1L, label = "Office")
+            val viewModel = subscribedViewModel(saved = listOf(place))
+            viewModel.onAction(DestinationAction.StartRename(place.id))
+            viewModel.onAction(DestinationAction.RenameChanged("Work"))
+
+            motion.value = VehicleMotion.MOVING
+
+            assertNull(viewModel.uiState.value.renaming)
+            assertEquals(listOf(place), store.current)
+
+            // Stopping again does not bring the field back, and a late Save has nothing to store.
+            motion.value = VehicleMotion.PARKED
+            viewModel.onAction(DestinationAction.SaveRename)
+            assertNull(viewModel.uiState.value.renaming)
+            assertEquals(listOf(place), store.current)
+        }
+
+    @Test
+    fun rename_is_ignored_while_moving() =
+        runTest {
+            motion.value = VehicleMotion.MOVING
+            val place = fakeSavedPlace(id = 1L, label = "Office")
+            val viewModel = subscribedViewModel(saved = listOf(place))
+
+            viewModel.onAction(DestinationAction.StartRename(place.id))
+
+            assertNull(viewModel.uiState.value.renaming)
+        }
+
+    @Test
+    fun saving_a_name_while_moving_stores_nothing() =
+        runTest {
+            val place = fakeSavedPlace(id = 1L, label = "Office")
+            val viewModel = subscribedViewModel(saved = listOf(place))
+            viewModel.onAction(DestinationAction.StartRename(place.id))
+            viewModel.onAction(DestinationAction.RenameChanged("Work"))
+            motion.value = VehicleMotion.MOVING
+
+            viewModel.onAction(DestinationAction.SaveRename)
+
+            assertEquals(listOf(place), store.current)
+        }
+
+    @Test
+    fun deleting_the_place_being_renamed_closes_the_field_and_a_save_brings_nothing_back() =
+        runTest {
+            val place = fakeSavedPlace(id = 1L, label = "Office")
+            val viewModel = subscribedViewModel(saved = listOf(place))
+            viewModel.onAction(DestinationAction.StartRename(place.id))
+            viewModel.onAction(DestinationAction.DeletePlace(place.id))
+
+            // Closed by the delete itself, before any Save: a Save of an open field for a gone place would
+            // otherwise be what clears it.
+            assertNull(viewModel.uiState.value.renaming)
+
+            viewModel.onAction(DestinationAction.SaveRename)
+
+            assertEquals(emptyList(), store.current)
         }
 
     @Test
@@ -668,6 +859,34 @@ class DestinationViewModelTest {
         }
 
     @Test
+    fun a_found_route_starts_the_finder_with_the_routes_origin() =
+        runTest {
+            val viewModel = subscribedViewModel(routingAvailable = true)
+            routing.installTile(TILE)
+            routing.engine.outcome = fakeEngineTrack()
+
+            viewModel.onAction(DestinationAction.RouteTo(DESTINATION, ORIGIN))
+            advanceUntilIdle()
+
+            val session = assertNotNull(activeRoute.active.value).session
+            assertEquals(listOf(session to RoutePoint(ORIGIN.point.latitude, ORIGIN.point.longitude)), candidateStarts)
+        }
+
+    // Once as the run starts, and again right before its search: the old route's candidates hold the planner too.
+    @Test
+    fun a_new_route_stops_the_finder_before_searching() =
+        runTest {
+            val viewModel = subscribedViewModel(routingAvailable = true)
+            routing.installTile(TILE)
+            routing.engine.outcome = fakeEngineTrack()
+
+            viewModel.onAction(DestinationAction.RouteTo(DESTINATION, ORIGIN))
+            advanceUntilIdle()
+
+            assertEquals(2, candidateCancels)
+        }
+
+    @Test
     fun a_route_run_cancels_a_running_reroute() =
         runTest {
             val viewModel = subscribedViewModel(routingAvailable = true)
@@ -675,6 +894,84 @@ class DestinationViewModelTest {
             viewModel.onAction(DestinationAction.RouteTo(DESTINATION, ORIGIN))
 
             assertEquals(1, rerouteCancels)
+        }
+
+    // --- Route conditions ----------------------------------------------------
+
+    @Test
+    fun toggling_a_chip_stores_the_conditions() =
+        runTest {
+            val viewModel = subscribedViewModel(routingAvailable = true)
+
+            viewModel.onAction(DestinationAction.SetAvoidTolls(on = true))
+            viewModel.onAction(DestinationAction.SetAvoidMotorways(on = true))
+
+            assertEquals(RouteConditions(avoidMotorways = true, avoidTolls = true), routeConditions.conditions.value)
+            assertEquals(routeConditions.conditions.value, viewModel.uiState.value.conditions)
+        }
+
+    // A slow disk: the second tap comes before the first is written, and must not undo it.
+    @Test
+    fun two_chip_taps_back_to_back_both_land() =
+        runTest {
+            val viewModel = subscribedViewModel(routingAvailable = true)
+            val writes = routeConditions.holdWrites()
+
+            viewModel.onAction(DestinationAction.SetAvoidTolls(on = true))
+            viewModel.onAction(DestinationAction.SetAvoidMotorways(on = true))
+            writes.complete(Unit)
+            advanceUntilIdle()
+
+            assertEquals(RouteConditions(avoidMotorways = true, avoidTolls = true), routeConditions.conditions.value)
+        }
+
+    // The chip is changed while the run waits on the routing data on the device.
+    @Test
+    fun a_route_run_passes_the_conditions_read_at_its_start() =
+        runTest {
+            val viewModel =
+                subscribedViewModel(routingAvailable = true, conditions = RouteConditions(avoidTolls = true))
+            routing.installTile(TILE)
+            routing.engine.outcome = fakeEngineTrack()
+            viewModel.onAction(DestinationAction.RouteTo(DESTINATION, ORIGIN))
+
+            viewModel.onAction(DestinationAction.SetAvoidTolls(on = false))
+            advanceUntilIdle()
+
+            assertEquals(
+                "1",
+                routing.engine.requests
+                    .single()
+                    .parameters["avoid_toll"],
+            )
+            assertEquals(RouteConditions(avoidTolls = true), activeRoute.active.value?.conditions)
+        }
+
+    @Test
+    fun a_failed_route_with_a_condition_on_says_so() =
+        runTest {
+            val viewModel =
+                subscribedViewModel(routingAvailable = true, conditions = RouteConditions(avoidTolls = true))
+            routing.installTile(TILE)
+            routing.engine.outcome = EngineOutcome.Error("no track found at pass=0")
+
+            viewModel.onAction(DestinationAction.RouteTo(DESTINATION, ORIGIN))
+            advanceUntilIdle()
+
+            assertEquals(RouteStep.Failed(RouteFailure.NO_ROUTE_UNDER_CONDITIONS), viewModel.uiState.value.route)
+        }
+
+    @Test
+    fun a_failed_route_without_conditions_keeps_the_old_message() =
+        runTest {
+            val viewModel = subscribedViewModel(routingAvailable = true)
+            routing.installTile(TILE)
+            routing.engine.outcome = EngineOutcome.Error("no track found at pass=0")
+
+            viewModel.onAction(DestinationAction.RouteTo(DESTINATION, ORIGIN))
+            advanceUntilIdle()
+
+            assertEquals(RouteStep.Failed(RouteFailure.NO_ROUTE), viewModel.uiState.value.route)
         }
 
     // A reroute of the old route may start while the data downloads; the search after it must not wait for one.
@@ -830,6 +1127,7 @@ class DestinationViewModelTest {
             assertEquals(RouteStep.Failed(RouteFailure.NO_ROAD_DATA), viewModel.uiState.value.route)
         }
 
+    // Without conditions, today's message.
     @Test
     fun a_search_out_of_time_is_timed_out() =
         runTest {
@@ -841,6 +1139,20 @@ class DestinationViewModelTest {
             advanceUntilIdle()
 
             assertEquals(RouteStep.Failed(RouteFailure.TIMED_OUT), viewModel.uiState.value.route)
+        }
+
+    @Test
+    fun a_search_out_of_time_with_a_condition_on_says_so() =
+        runTest {
+            val viewModel =
+                subscribedViewModel(routingAvailable = true, conditions = RouteConditions(avoidMotorways = true))
+            routing.installTile(TILE)
+            routing.engine.outcome = EngineOutcome.Error("operation timeout after 60 seconds")
+
+            viewModel.onAction(DestinationAction.RouteTo(DESTINATION, ORIGIN))
+            advanceUntilIdle()
+
+            assertEquals(RouteStep.Failed(RouteFailure.TIMED_OUT_UNDER_CONDITIONS), viewModel.uiState.value.route)
         }
 
     @Test

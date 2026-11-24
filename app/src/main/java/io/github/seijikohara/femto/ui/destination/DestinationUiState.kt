@@ -3,14 +3,15 @@ package io.github.seijikohara.femto.ui.destination
 import io.github.seijikohara.femto.data.location.VehicleMotion
 import io.github.seijikohara.femto.data.places.PlaceTarget
 import io.github.seijikohara.femto.data.places.SavedPlace
+import io.github.seijikohara.femto.data.routing.RouteConditions
 import io.github.seijikohara.femto.data.voice.VoiceState
 import java.util.Locale
 
 /**
  * State for the destination panel. [motion] is the shared vehicle-motion
  * verdict (`LocationGraph.vehicleMotion()`); [typingAllowed] derives from it
- * the gate on every edit that involves typing — the text field, saving and
- * deleting places — while voice and a tap on a saved place work in every
+ * the gate on every edit that involves typing — the text field, saving,
+ * renaming and deleting places — while voice and a tap on a saved place work in every
  * motion state (issue #389, Safety).
  *
  * [handOffAvailable] is false when no installed app takes a destination; the
@@ -21,11 +22,16 @@ import java.util.Locale
  * the launcher's own map (`routingAvailableFlow`); off, the panel shows
  * nothing about routes. [geocoderAvailable] says whether text can become a
  * position on this device at all; without a geocoder only a saved point can be
- * routed to. [route] is where a route the panel asked for stands.
+ * routed to. [route] is where a route the panel asked for stands. [conditions] are the roads the next route
+ * avoids, as the driver last picked them.
  *
  * [pickedPoint] is a point picked with a long press on the map, which the
  * panel offers in place of the text entry until the driver goes back to the
  * search or the panel closes. It is not saved unless the driver saves it.
+ *
+ * [renaming] is the name being typed for one saved place, or null. Renaming is typing, so it follows
+ * [typingAllowed]: it never starts while moving, and a rename open when the vehicle starts to move closes without
+ * saving, as the panel's own field would have stopped taking text.
  */
 internal data class DestinationUiState(
     val query: String,
@@ -37,6 +43,8 @@ internal data class DestinationUiState(
     val geocoderAvailable: Boolean = false,
     val route: RouteStep = RouteStep.Idle,
     val pickedPoint: PlaceTarget.Point? = null,
+    val conditions: RouteConditions = RouteConditions(),
+    val renaming: RenameDraft? = null,
 ) {
     /**
      * Whether [target] can be routed to: a point always, text only through a
@@ -69,6 +77,12 @@ internal data class DestinationUiState(
             )
     }
 }
+
+/** The name typed so far ([text]) for the saved place [id], while its row is a field. */
+internal data class RenameDraft(
+    val id: Long,
+    val text: String,
+)
 
 /**
  * Where a route the panel asked for stands. Every step but [Idle] takes the
@@ -162,6 +176,12 @@ internal enum class RouteFailure {
     /** The search ran out of time; a closer destination may work. */
     TIMED_OUT,
 
+    /**
+     * [TIMED_OUT] for a route with a condition on: a search that rules roads out can take far longer, as one that
+     * finds no way round a toll road does, so turning the condition off may help.
+     */
+    TIMED_OUT_UNDER_CONDITIONS,
+
     /** The installed routing data was built for another version of the app's lookup table. */
     DATA_VERSION_MISMATCH,
 
@@ -170,6 +190,12 @@ internal enum class RouteFailure {
 
     /** Anything else the engine reports, such as no road connecting the two ends. */
     NO_ROUTE,
+
+    /**
+     * [NO_ROUTE] for a route with a condition on: avoiding tolls rules out every toll road, so a destination only a
+     * toll road reaches gets no route, and turning the condition off may find one.
+     */
+    NO_ROUTE_UNDER_CONDITIONS,
 }
 
 /** Intents the destination panel reports up to its ViewModel. */
@@ -208,6 +234,29 @@ internal sealed interface DestinationAction {
     data class DeletePlace(
         val id: Long,
     ) : DestinationAction
+
+    /**
+     * Turn the row of the saved place [id] into a name field; not while moving, and ignored for a place that is not
+     * there. The field starts with the place's name, or empty for an unnamed place (the panel's placeholder shows
+     * what it was saved as). Another row's open field closes without saving.
+     */
+    data class StartRename(
+        val id: Long,
+    ) : DestinationAction
+
+    /** The name field changed; cut to the name cap, and ignored while moving or with no field open. */
+    data class RenameChanged(
+        val text: String,
+    ) : DestinationAction
+
+    /**
+     * Store the typed name for the open field's place and close the field; not while moving. A blank name, or one
+     * equal to the place's label, removes the name: an unnamed place stays as it was, a named one loses its name.
+     */
+    data object SaveRename : DestinationAction
+
+    /** Close the name field without saving. Allowed in every motion state: it types nothing. */
+    data object CancelRename : DestinationAction
 
     /**
      * Empty the query after a hand-off, so the next open starts fresh. Allowed
@@ -259,6 +308,19 @@ internal sealed interface DestinationAction {
 
     /** After [RouteFailure.DATA_VERSION_MISMATCH]: delete the route's routing data and fetch it again. */
     data object DownloadAgain : DestinationAction
+
+    /**
+     * Have the next route avoid motorways, or stop avoiding them; remembered for the routes after it. A tap, like a
+     * saved place, so allowed in every motion state. A route under way keeps the conditions it started with.
+     */
+    data class SetAvoidMotorways(
+        val on: Boolean,
+    ) : DestinationAction
+
+    /** As [SetAvoidMotorways], for toll roads. */
+    data class SetAvoidTolls(
+        val on: Boolean,
+    ) : DestinationAction
 
     /**
      * Stop the route under way, or put its message away, and give the panel

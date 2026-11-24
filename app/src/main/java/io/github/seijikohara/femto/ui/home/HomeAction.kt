@@ -29,7 +29,7 @@ internal sealed interface HomeAction {
 
     /**
      * Hand [target] to the user's navigation app: the destination panel's
-     * Navigate (a typed or dictated query) or a tap on a saved place. [label]
+     * Open in maps app (a typed or dictated query) or a tap on a saved place. [label]
      * names the pin a saved point drops; a query ignores it.
      */
     data class Navigate(
@@ -59,6 +59,15 @@ internal sealed interface HomeAction {
      * is no callback confirming whether any app resumed from the key alone.
      */
     data object PlayDefaultMusic : HomeAction
+
+    /**
+     * The music card's play button on the track that played last (`MusicCardState.LastPlayed`): ask the app
+     * [packageName] to resume it. The button names the app the card shows, so a tap that lands after a live session
+     * took the card starts nothing.
+     */
+    data class ResumeLastPlayed(
+        val packageName: String,
+    ) : HomeAction
 
     data object OpenBrowser : HomeAction
 
@@ -103,6 +112,14 @@ internal sealed interface HomeAction {
 
     /** The speed readout's clear button on the route row: the active route goes, from the map too. */
     data object ClearRoute : HomeAction
+
+    /** A row of the route choice card: candidate [index] becomes the route followed. */
+    data class SelectRouteCandidate(
+        val index: Int,
+    ) : HomeAction
+
+    /** The route choice card's close button: the card goes, and the route chosen stays. */
+    data object CloseRouteChoice : HomeAction
 
     /** The dock's long-press menu: swap a nav button one step within the visible order. */
     data class MoveDockNav(

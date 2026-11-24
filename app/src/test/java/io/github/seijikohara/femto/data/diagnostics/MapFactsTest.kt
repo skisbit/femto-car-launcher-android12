@@ -10,8 +10,12 @@ import io.github.seijikohara.femto.data.map.offline.RegionDownloadPhase
 import io.github.seijikohara.femto.data.map.offline.SavedRegion
 import io.github.seijikohara.femto.data.map.offline.TileBenchmarkOutcome
 import io.github.seijikohara.femto.data.map.offline.TileBenchmarkRow
+import io.github.seijikohara.femto.data.routing.CandidateSearch
+import io.github.seijikohara.femto.data.routing.CandidateSearchEnding
 import io.github.seijikohara.femto.data.routing.InstalledRoutingTile
 import io.github.seijikohara.femto.data.routing.RerouteStats
+import io.github.seijikohara.femto.data.routing.RouteConditions
+import io.github.seijikohara.femto.data.routing.RouteRestoreDecision
 import io.github.seijikohara.femto.data.routing.RouteRun
 import io.github.seijikohara.femto.data.routing.RouteRunOutcome
 import org.junit.Test
@@ -528,10 +532,78 @@ class MapFactsTest {
                 DiagnosticFact("Routing", FactValue.Text("available")),
                 DiagnosticFact("Routing data", FactValue.Text("2 tiles, 144 MB")),
                 DiagnosticFact("Last route", FactValue.Text("timed out, 60012 ms")),
+                DiagnosticFact("Route conditions", FactValue.Text("none")),
+                DiagnosticFact("Route candidates", FactValue.Text("none this session")),
                 DiagnosticFact("Last reroute", FactValue.Text("none this session")),
+                DiagnosticFact("Route restore", FactValue.Text("none this session")),
                 DiagnosticFact("Geocoder", FactValue.Text("absent")),
             ),
             facts,
+        )
+    }
+
+    @Test
+    fun `the route restore says what the start did with the kept route`() {
+        val texts =
+            RouteRestoreDecision.entries.map { decision ->
+                routingFacts(RoutingFacts(true, emptyList(), null, true, restore = decision))
+                    .single { it.label == "Route restore" }
+                    .value
+            }
+
+        assertEquals(
+            listOf(
+                "restored",
+                "parked too long, deleted",
+                "no route kept",
+                "waiting for a GPS fix",
+                "replaced by a new route",
+                "no time of the last drive, deleted",
+                "GPS time before the last drive, deleted",
+            ).map { FactValue.Text(it) },
+            texts,
+        )
+    }
+
+    @Test
+    fun `each candidate's computing time is reported in the order found, with how the search ended`() {
+        val search = CandidateSearch(listOf(500L, 1_100L, 1_640L), CandidateSearchEnding.ALL_FOUND)
+
+        val facts = routingFacts(RoutingFacts(true, emptyList(), null, true, candidateSearch = search))
+
+        assertEquals(
+            FactValue.Text("3: 0.5 s, 1.1 s, 1.6 s; all found"),
+            facts.single { it.label == "Route candidates" }.value,
+        )
+    }
+
+    @Test
+    fun `a candidate search that ended early or was stopped says so`() {
+        val endings = listOf(CandidateSearchEnding.NO_MORE_ROUTES, CandidateSearchEnding.STOPPED, null)
+
+        val texts =
+            endings.map { ending ->
+                val search = CandidateSearch(listOf(500L), ending)
+                routingFacts(RoutingFacts(true, emptyList(), null, true, candidateSearch = search))
+                    .single { it.label == "Route candidates" }
+                    .value
+            }
+
+        assertEquals(
+            listOf("1: 0.5 s; no more routes", "1: 0.5 s; stopped", "1: 0.5 s; searching").map { FactValue.Text(it) },
+            texts,
+        )
+    }
+
+    @Test
+    fun `the route conditions the next route runs under are reported`() {
+        val conditions = RouteConditions(avoidMotorways = true, avoidTolls = true)
+
+        val facts = routingFacts(RoutingFacts(true, emptyList(), null, true, conditions = conditions))
+
+        assertEquals(
+            FactValue.Text("avoid motorways, avoid tolls"),
+            facts.single { it.label == "Route conditions" }.value,
         )
     }
 
@@ -585,7 +657,17 @@ class MapFactsTest {
         routing: RoutingFacts,
         backend: MapBackend = MapBackend.OSM,
     ): List<DiagnosticFact> {
-        val label = setOf("Routing", "Routing data", "Last route", "Last reroute", "Geocoder")
+        val label =
+            setOf(
+                "Routing",
+                "Routing data",
+                "Last route",
+                "Route conditions",
+                "Route candidates",
+                "Last reroute",
+                "Route restore",
+                "Geocoder",
+            )
         return facts(backend = backend, routing = routing).filter { it.label in label }
     }
 

@@ -66,6 +66,15 @@
     <string name="speed_route_rerouting">Rerouting…</string>
     <string name="speed_route_reroute_no_data">No routing data here</string>
     <string name="speed_route_reroute_failed">Could not reroute</string>
+    <!-- The route choice card over the map (issue #389 phase 3): the routes found to the destination, one row each, while
+         the driver may still choose the one to follow. -->
+    <string name="route_choice_title">Choose a route</string>
+    <!-- %1$d = the route's number on the card, 1 for the route found first. -->
+    <string name="route_choice_candidate">Route %1$d</string>
+    <string name="route_choice_finding">Finding another route…</string>
+    <string name="route_choice_none">No other route found</string>
+    <!-- Closes the card and keeps the route chosen. -->
+    <string name="route_choice_close">Done</string>
 
     <!-- Weather curve axis label for the first (current) hour. -->
     <string name="weather_curve_now">Now</string>
@@ -143,6 +152,10 @@
     <string name="music_connect_hint">Grant notification access and your music appears here, controllable from the dashboard.</string>
     <string name="music_nothing_playing">Nothing is playing</string>
     <string name="music_nothing_hint">Tap to resume playback, or open your music app.</string>
+    <!-- Eyebrow over the track that played last; %1$s is the app's name. Shown in capitals. -->
+    <string name="music_last_played">Last played · %1$s</string>
+    <!-- Play button on the track that played last; %1$s is the track's title. -->
+    <string name="music_resume">Resume %1$s</string>
     <string name="music_skip_previous">Skip previous</string>
     <string name="music_play_pause">Play / pause</string>
     <string name="music_skip_next">Skip next</string>
@@ -185,21 +198,30 @@
     <string name="destination_title">Destination</string>
     <string name="destination_open_maps">Open maps app</string>
     <string name="destination_query_hint">Search for a place or address</string>
-    <string name="destination_navigate">Navigate</string>
+    <!-- Hands the destination to another app; named for that, above Show route, which stays on the launcher's map. -->
+    <string name="destination_navigate">Open in maps app</string>
     <string name="destination_save_query">Save</string>
     <string name="destination_save_location">Save current location</string>
     <!-- Shown under the disabled text field while the vehicle moves. -->
     <string name="destination_moving_hint">Typing works when stopped. Voice and saved places work now.</string>
-    <!-- Shown under the text field when no installed app takes a destination; Navigate and the saved places are off. -->
+    <!-- Shown under the text field when no installed app takes a destination; Open in maps app and the saved places are off. -->
     <string name="destination_no_handler">No app on this device can open a destination. Install a maps or navigation app.</string>
     <string name="destination_saved_places">Saved places</string>
     <string name="destination_no_saved_places">No saved places yet. Save a search or your current location while stopped.</string>
-    <!-- %1$s = the saved place's label -->
+    <!-- %1$s = the saved place's title (its own name, else its label) -->
     <string name="destination_delete_place">Delete %1$s</string>
+    <!-- %1$s = the saved place's title (its own name, else its label) -->
+    <string name="destination_rename_place">Rename %1$s</string>
+    <!-- The empty name field of a saved place's row while it is renamed, which a screen reader announces as the field's purpose; %1$s = what the place was saved as (its label) -->
+    <string name="destination_rename_placeholder">Name for %1$s</string>
+    <string name="destination_rename_save">Save name</string>
+    <string name="destination_rename_cancel">Cancel renaming</string>
+    <!-- What a tap on a saved place does, for screen readers; %1$s = the saved place's title (its own name, else its label) -->
+    <string name="destination_open_place">Open %1$s in maps app</string>
     <!-- Route preview (issue #389 phase 3, nightly builds only): a route on the launcher's own map. -->
-    <string name="destination_route">Route</string>
-    <!-- %1$s = the saved place's label -->
-    <string name="destination_route_place">Route to %1$s</string>
+    <string name="destination_route">Show route</string>
+    <!-- %1$s = the saved place's title (its own name, else its label) -->
+    <string name="destination_route_place">Show route to %1$s</string>
     <string name="destination_route_finding_position">Finding your position…</string>
     <string name="destination_route_locating">Looking up the place…</string>
     <string name="destination_route_no_fix">No current GPS position. A route starts from where you are now, so try again once the GPS finds your position.</string>
@@ -220,6 +242,13 @@
     <string name="destination_route_download_again">Download again</string>
     <string name="destination_route_failed_download">The routing data could not be downloaded. Check the connection and try again.</string>
     <string name="destination_route_failed">No route could be found to that destination.</string>
+    <!-- Shown in place of destination_route_failed when the route ran with a condition on: avoiding tolls rules out every toll road. -->
+    <string name="destination_route_failed_conditions">No route under these conditions. Turn a condition off and try again.</string>
+    <!-- Shown in place of destination_route_failed_timed_out when the route ran with a condition on. -->
+    <string name="destination_route_timed_out_conditions">The route took too long. Turning a condition off may help.</string>
+    <!-- Route conditions: toggles under the Show route action, remembered for the next route and used by every reroute. -->
+    <string name="destination_avoid_motorways">Avoid motorways</string>
+    <string name="destination_avoid_tolls">Avoid tolls</string>
     <string name="destination_route_dismiss">OK</string>
     <!-- Shown while the routing data a route reads is checked against brouter.de, at most once a week per area. -->
     <string name="destination_route_checking">Checking the routing data for updates…</string>

@@ -33,19 +33,25 @@ import io.github.seijikohara.femto.data.geocoding.ShortAddress
 import io.github.seijikohara.femto.data.location.LocationGraph
 import io.github.seijikohara.femto.data.location.TripState
 import io.github.seijikohara.femto.data.location.VehicleMotion
+import io.github.seijikohara.femto.data.location.arrivedStale
 import io.github.seijikohara.femto.data.location.isGpsFix
 import io.github.seijikohara.femto.data.location.vehicleMotionFlow
 import io.github.seijikohara.femto.data.location.withParkedDwell
 import io.github.seijikohara.femto.data.music.AudioSpectrumRepository
+import io.github.seijikohara.femto.data.music.LastPlayedKeeper
+import io.github.seijikohara.femto.data.music.MediaResumer
 import io.github.seijikohara.femto.data.music.MusicCardState
 import io.github.seijikohara.femto.data.music.MusicCommand
 import io.github.seijikohara.femto.data.music.MusicSessionRepository
+import io.github.seijikohara.femto.data.music.PlatformResumePort
+import io.github.seijikohara.femto.data.music.ResumeOutcome
 import io.github.seijikohara.femto.data.routing.ActiveRoute
 import io.github.seijikohara.femto.data.routing.ActiveRouteStore
 import io.github.seijikohara.femto.data.routing.FollowEvent
 import io.github.seijikohara.femto.data.routing.RerouteStatus
 import io.github.seijikohara.femto.data.routing.Rerouter
 import io.github.seijikohara.femto.data.routing.RouteFix
+import io.github.seijikohara.femto.data.routing.RoutePersistence
 import io.github.seijikohara.femto.data.routing.RoutePoint
 import io.github.seijikohara.femto.data.routing.followFlow
 import io.github.seijikohara.femto.data.routing.routingAvailableFlow
@@ -65,6 +71,7 @@ import io.github.seijikohara.femto.data.weather.WeatherSnapshot
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -74,6 +81,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.distinctUntilChangedBy
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
@@ -81,8 +89,10 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.transformLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Cache
 import okhttp3.OkHttpClient
 import java.io.File
@@ -120,6 +130,10 @@ internal class HomeViewModel(
     private val nowElapsedRealtimeNanos: () -> Long = SystemClock::elapsedRealtimeNanos,
     private val sendMusicCommand: (MusicCommand) -> Unit = {},
     private val resumeLastMusicSession: () -> Unit = {},
+    // The resume chain for the track that played last (MediaResumer.resume),
+    // true when it started playback. Run in viewModelScope so clearing the
+    // dashboard cancels it and its browser connection goes with it.
+    private val resumeLastPlayed: suspend (packageName: String) -> Boolean = { false },
     private val resetTrip: () -> Unit = {},
     private val resolveMusicSourceComponent: (String) -> ComponentName? = { null },
     private val spectrumEnabledFlow: Flow<Boolean> = flowOf(false),
@@ -127,16 +141,25 @@ internal class HomeViewModel(
     // The active route (ActiveRouteStore) and whether this build and map backend
     // offer routing (routingAvailableFlow). Default to none and off, so previews
     // and tests that do not exercise routing show none of it.
-    activeRouteFlow: Flow<ActiveRoute?> = flowOf(null),
+    private val activeRouteFlow: Flow<ActiveRoute?> = flowOf(null),
     routingAvailable: Flow<Boolean> = flowOf(false),
     private val clearRoute: () -> Unit = {},
     // Where the follow reports that the vehicle left the route of a session, and
     // that it is back on it (the Rerouter).
     onLeftRoute: (session: Long, fix: RouteFix) -> Unit = { _, _ -> },
     onBackOnRoute: (session: Long) -> Unit = {},
+    // The route choice card's two actions on the store: a candidate becomes the
+    // route followed, and the card closes keeping the route chosen.
+    private val selectRouteCandidate: (session: Long, index: Int) -> Unit = { _, _ -> },
+    private val closeRouteChoice: (session: Long) -> Unit = {},
     // Where the active route's progress is worked out; tests pin it to their
     // scheduler.
     routeDispatcher: CoroutineDispatcher = Dispatchers.Default,
+    // The time of each live GPS fix, taken as the trip meter takes fixes, for
+    // the route kept across a restart (RoutePersistence): its last-driven
+    // stamp and its check at the first fix, which also runs with no route on
+    // the map. Defaults to nowhere, so previews and tests are unaffected.
+    private val onGpsFix: (timeEpochMs: Long) -> Unit = {},
 ) : ViewModel() {
     // The builds the update prompt has been answered about in this process. The
     // prompt closes on the answer itself, not on the store's write: a slow disk
@@ -144,6 +167,22 @@ internal class HomeViewModel(
     // close it (the updater keeps its daily gate in memory for the same
     // reason). The store carries the answers to later processes.
     private val answeredVersionCodes = MutableStateFlow(emptySet<Int>())
+
+    // The app whose last played track a resume attempt is bringing back, or
+    // null. One attempt at a time: a tap while one runs does nothing.
+    private val resumingPackage = MutableStateFlow<String?>(null)
+
+    // The music card's state as the dashboard last received it, mirrored as
+    // it passes into uiState. A resume attempt waits on this alone for the
+    // card to show the playback: a wait on uiState would subscribe to it and,
+    // with the dashboard left, restart every dashboard source for the wait.
+    private val cardMusic = MutableStateFlow(HomeUiState.Initial.musicState)
+
+    // The motion verdict as each fix or trip update arrives (vehicleMotionFlow),
+    // for the update dot and the route choice card; each reader collects it
+    // afresh.
+    private val vehicleMotion: Flow<VehicleMotion> =
+        vehicleMotionFlow(locationFlow, tripStateFlow, nowElapsedRealtimeNanos)
 
     // The dock's update dot: an update is on offer and a live GPS fix shows the
     // vehicle parked (fail-closed; see VehicleMotion). The motion is judged as
@@ -159,7 +198,7 @@ internal class HomeViewModel(
         combine(
             updateStateFlow,
             updateSettingsFlow.catchAsDefault(TAG, "update badge settings", UpdateSettings.Default),
-            vehicleMotionFlow(locationFlow, tripStateFlow, nowElapsedRealtimeNanos),
+            vehicleMotion,
         ) { state, settings, motion -> state.offersUpdate(settings) && motion == VehicleMotion.PARKED }
             .onStart { emit(false) }
             .distinctUntilChanged()
@@ -174,12 +213,25 @@ internal class HomeViewModel(
     // (e.g. a SecurityException when a permission is revoked between check and
     // register) would otherwise cancel the shared combine and crash the HOME
     // process. Catching per source degrades only that card to its initial value.
+    //
+    // The fixes reach onGpsFix from this collection, the dashboard's own: the
+    // route keeper adds no location request and hears nothing once the
+    // dashboard stops collecting.
     private val coreSignals: Flow<CoreSignals> =
         combine(
-            locationFlow.catchAsDefault(TAG, "location", HomeUiState.Initial.location),
+            locationFlow
+                .onEach { fix ->
+                    fix
+                        ?.takeIf { it.isGpsFix() && !it.arrivedStale(nowElapsedRealtimeNanos()) }
+                        ?.let { onGpsFix(it.time) }
+                }.catchAsDefault(TAG, "location", HomeUiState.Initial.location),
             addressFlow.catchAsDefault(TAG, "address", HomeUiState.Initial.address),
             weatherFlow.catchAsDefault(TAG, "weather", HomeUiState.Initial.weather),
-            musicStateFlow.catchAsDefault(TAG, "music", HomeUiState.Initial.musicState),
+            // The card's last played track shows its attempt as resuming.
+            musicStateFlow
+                .catchAsDefault(TAG, "music", HomeUiState.Initial.musicState)
+                .onEach { cardMusic.value = it }
+                .combine(resumingPackage) { music, resuming -> music.resumingIn(resuming) },
             updateBadge,
         ) { location, address, weather, music, badge ->
             CoreSignals(location, address, weather, music, badge)
@@ -211,7 +263,8 @@ internal class HomeViewModel(
     // with the route's session. It restarts on a new session or a new route (a
     // reroute's), never on a reroute status alone: a restart would put the
     // progress back to the start of the line and the off-route watch back to
-    // unarmed. The status joins in beside it.
+    // unarmed. The status and the choice card join in beside it: selecting a
+    // candidate changes the route, which restarts the follow on the new line.
     private val activeRoute: Flow<ActiveRouteState?> =
         combine(activeRouteFlow, routingAvailable) { active, available -> active?.takeIf { available } }
             .distinctUntilChangedBy { it?.session to it?.route }
@@ -227,14 +280,14 @@ internal class HomeViewModel(
                                     null -> Unit
                                 }
                             },
-                        activeRouteFlow
-                            .map { current -> current?.takeIf { it.session == shown.session }?.reroute }
-                            .distinctUntilChanged(),
-                    ) { follow, reroute ->
+                        activeRouteFlow.map { it.sessionView(shown.session) }.distinctUntilChanged(),
+                    ) { follow, view ->
                         ActiveRouteState(
                             line = shown.route.points,
                             progress = follow.progress,
-                            reroute = reroute ?: RerouteStatus.NONE,
+                            reroute = view.reroute,
+                            choice = view.choice,
+                            alternativeLines = view.alternativeLines,
                         )
                     }
                 } ?: flowOf(null)
@@ -242,6 +295,34 @@ internal class HomeViewModel(
             .onStart { emit(null) }
             .distinctUntilChanged()
             .catchAsDefault(TAG, "route", null)
+
+    // The choice card closes by itself once the vehicle has read MOVING for
+    // ROUTE_CHOICE_DRIVING_CLOSE_MS without a break: by then the route being
+    // followed is the one chosen, and the card would only sit on the map. Any
+    // other verdict starts the count over; selecting a candidate does not, as
+    // the count is keyed on the session alone. The motion is read only while a
+    // card is open, and the count runs while the dashboard collects uiState.
+    // Its one emission lets the combine below start without waiting on it.
+    private val routeChoiceAutoClose: Flow<Unit> =
+        activeRouteFlow
+            .map { active -> active?.takeIf { it.choosing }?.session }
+            .distinctUntilChanged()
+            .flatMapLatest { session ->
+                session?.let { open ->
+                    vehicleMotion
+                        .map { it == VehicleMotion.MOVING }
+                        .distinctUntilChanged()
+                        .transformLatest { driving ->
+                            if (driving) {
+                                delay(ROUTE_CHOICE_DRIVING_CLOSE_MS)
+                                closeRouteChoice(open)
+                            }
+                            emit(Unit)
+                        }
+                } ?: flowOf(Unit)
+            }.onStart { emit(Unit) }
+            .distinctUntilChanged()
+            .catchAsDefault(TAG, "route choice auto-close", Unit)
 
     // Seeded off like the route, so the dashboard never waits on the settings store.
     private val routingOffered: Flow<Boolean> =
@@ -256,7 +337,7 @@ internal class HomeViewModel(
             calendarFlow.catchAsDefault(TAG, "calendar", HomeUiState.Initial.calendar),
             systemStatusFlow.catchAsDefault(TAG, "system status", HomeUiState.Initial.systemStatus),
             tripStateFlow.catchAsDefault(TAG, "trip state", HomeUiState.Initial.tripState),
-            combine(activeRoute, routingOffered, ::Pair),
+            combine(activeRoute, routingOffered, routeChoiceAutoClose) { route, offered, _ -> route to offered },
         ) { core, calendar, systemStatus, tripState, (route, offered) ->
             HomeUiState(
                 location = core.location,
@@ -411,6 +492,10 @@ internal class HomeViewModel(
                 mutableEvents.tryEmit(HomeEvent.LaunchAppCategory(Intent.CATEGORY_APP_MUSIC))
             }
 
+            is HomeAction.ResumeLastPlayed -> {
+                startResume(action.packageName)
+            }
+
             HomeAction.OpenBrowser -> {
                 mutableEvents.tryEmit(HomeEvent.LaunchAppCategory(Intent.CATEGORY_APP_BROWSER))
             }
@@ -463,6 +548,20 @@ internal class HomeViewModel(
                 clearRoute()
             }
 
+            // The card on screen names its session, so a tap that lands after a
+            // new route has started changes nothing of it.
+            is HomeAction.SelectRouteCandidate -> {
+                uiState.value.activeRoute
+                    ?.choice
+                    ?.let { selectRouteCandidate(it.session, action.index) }
+            }
+
+            HomeAction.CloseRouteChoice -> {
+                uiState.value.activeRoute
+                    ?.choice
+                    ?.let { closeRouteChoice(it.session) }
+            }
+
             is HomeAction.MoveDockNav -> {
                 mutableEvents.tryEmit(HomeEvent.MoveDockNav(action.id, action.direction))
             }
@@ -489,6 +588,38 @@ internal class HomeViewModel(
         }
     }
 
+    // Resume the track the card offers from [packageName], unless an attempt
+    // already runs. The card must still offer that app: a tap that lands after
+    // a live session took the card would otherwise wake a second app over it.
+    // The flag clears however the attempt ends, cancellation included, so the
+    // button is usable again whenever the card still offers the track.
+    private fun startResume(packageName: String) {
+        val offered = uiState.value.musicState.offeredPackageOrNull() == packageName
+        if (offered && resumingPackage.compareAndSet(null, packageName)) {
+            viewModelScope.launch {
+                try {
+                    if (resumeLastPlayed(packageName)) awaitCardLeaves(packageName)
+                } finally {
+                    resumingPackage.value = null
+                }
+            }
+        }
+    }
+
+    // The attempt sees the app play before the card does: the card's state
+    // takes its own way (the session watch, the store, back to the main
+    // thread). Until the card stops offering the track the button stays
+    // pending, so a tap in between cannot send prepare() and play() again to
+    // an app already playing, which an older app answers by reloading the
+    // track. Bounded, in case the card never hears of the playback, as when
+    // the dashboard is no longer collecting: the wait reads the card's mirror
+    // (cardMusic) and subscribes to nothing.
+    private suspend fun awaitCardLeaves(packageName: String) {
+        withTimeoutOrNull(RESUME_SETTLE_GRACE_MS) {
+            cardMusic.first { it.offeredPackageOrNull() != packageName }
+        }
+    }
+
     // Either answer settles the prompt for build [versionCode]: it closes at
     // once, and never asks about the build again, in this process or a later one.
     private fun answerUpdatePrompt(versionCode: Int) {
@@ -496,6 +627,24 @@ internal class HomeViewModel(
         viewModelScope.launch { recordUpdatePrompted(versionCode) }
     }
 }
+
+/**
+ * How long, after an attempt started playback, the resume button stays pending at most while the card has not yet
+ * switched from the last played track to the live session. The switch normally takes well under a second; internal
+ * so tests probe both sides.
+ */
+internal const val RESUME_SETTLE_GRACE_MS = 3_000L
+
+// The app whose last played track the card offers, or null.
+private fun MusicCardState.offeredPackageOrNull(): String? = (this as? MusicCardState.LastPlayed)?.track?.packageName
+
+// The card's last played track from [packageName], marked as resuming while an attempt for it runs; any other state
+// passes unchanged.
+private fun MusicCardState.resumingIn(packageName: String?): MusicCardState =
+    (this as? MusicCardState.LastPlayed)
+        ?.takeIf { it.track.packageName == packageName }
+        ?.copy(resuming = true)
+        ?: this
 
 // Each reading only when the fix carries it: a missing speed must read as unknown, not as standing still. A GPS fix
 // without one takes [tripSpeedMs], the trip's speed from the positions; a network fix's position is too coarse for it.
@@ -509,6 +658,53 @@ private fun Location.toRouteFix(tripSpeedMs: Double): RouteFix =
     )
 
 private const val NANOS_PER_MILLI = 1_000_000L
+
+// What the dashboard shows of route session [session] beside its line: where a
+// reroute of it stands and, while the driver may still choose, the choice card
+// and the routes not selected. Another session, or none, shows nothing.
+private data class SessionView(
+    val reroute: RerouteStatus = RerouteStatus.NONE,
+    val choice: RouteChoiceState? = null,
+    val alternativeLines: List<List<RoutePoint>> = emptyList(),
+)
+
+private fun ActiveRoute?.sessionView(session: Long): SessionView =
+    this
+        ?.takeIf { it.session == session }
+        ?.let { active ->
+            SessionView(
+                reroute = active.reroute,
+                choice =
+                    active.takeIf { it.choosing }?.let {
+                        RouteChoiceState(
+                            session = session,
+                            candidates =
+                                it.candidates.map { candidate ->
+                                    CandidateSummary(
+                                        distanceMeters = candidate.route.distanceMeters,
+                                        durationSeconds = candidate.route.durationSeconds,
+                                    )
+                                },
+                            selected = it.selected,
+                            finding = it.finding,
+                            searchCompleted = it.searchCompleted,
+                        )
+                    },
+                alternativeLines =
+                    active.candidates
+                        .takeIf { active.choosing }
+                        .orEmpty()
+                        .filterIndexed { index, _ -> index != active.selected }
+                        .map { it.route.points },
+            )
+        } ?: SessionView()
+
+/**
+ * How long the vehicle must read MOVING without a break before the route
+ * choice card closes by itself, keeping the route chosen. Internal so tests
+ * probe both sides of it.
+ */
+internal const val ROUTE_CHOICE_DRIVING_CLOSE_MS = 30_000L
 
 // File-private holder that groups the first five slots (four sources and the
 // update badge) so the two-stage combine stays within Kotlin's typed
@@ -601,7 +797,11 @@ internal class HomeViewModelFactory(
                 userAgent = femtoUserAgent,
             )
         val weather = WeatherRepository(weatherApi, locationFlow, clockFlow)
-        val music = MusicSessionRepository(application)
+        // One keeper for the card's memory and the resume chain, so an app the
+        // chain finds gone is forgotten in the store the card reads.
+        val lastPlayed = LastPlayedKeeper.of(application)
+        val music = MusicSessionRepository(application, lastPlayed)
+        val resumer = MediaResumer(port = PlatformResumePort(application), forget = lastPlayed::forget)
         val audioSpectrum = AudioSpectrumRepository(application)
         val calendarPreferences = CalendarPreferences(application)
         val calendar = CalendarRepository(application, clockFlow, calendarPreferences.hiddenCalendarIds)
@@ -609,6 +809,12 @@ internal class HomeViewModelFactory(
         val apps = AppsRepository(application)
         val displayPreferences = DisplayPreferences(application)
         val updatePreferences = UpdatePreferences(application)
+        val routingEnabled = application.resources.getBoolean(R.bool.routing_enabled)
+        // Started here, beside the rerouter's wiring, once per process: the
+        // route the last process left on the map comes back, or its files go,
+        // off the main thread while the dashboard opens. A build without
+        // routing only deletes what an earlier build left.
+        val routeKeeper = RoutePersistence.get(application).apply { start(enabled = routingEnabled) }
 
         @Suppress("UNCHECKED_CAST")
         return HomeViewModel(
@@ -629,6 +835,7 @@ internal class HomeViewModelFactory(
             recordUpdatePrompted = updatePreferences::recordPrompted,
             sendMusicCommand = music::send,
             resumeLastMusicSession = music::dispatchPlayMediaKey,
+            resumeLastPlayed = { packageName -> resumer.resume(packageName) is ResumeOutcome.Started },
             resetTrip = locationGraph::resetTrip,
             resolveMusicSourceComponent = apps::launcherComponentFor,
             spectrumEnabledFlow =
@@ -639,7 +846,7 @@ internal class HomeViewModelFactory(
             activeRouteFlow = ActiveRouteStore.shared.active,
             routingAvailable =
                 routingAvailableFlow(
-                    enabled = application.resources.getBoolean(R.bool.routing_enabled),
+                    enabled = routingEnabled,
                     settings = displayPreferences.settings,
                 ),
             clearRoute = ActiveRouteStore.shared::clear,
@@ -648,6 +855,9 @@ internal class HomeViewModelFactory(
             // routing stack behind it.
             onLeftRoute = { session, fix -> Rerouter.get(application).onLeftRoute(session, fix) },
             onBackOnRoute = { session -> Rerouter.get(application).onBackOnRoute(session) },
+            selectRouteCandidate = { session, index -> ActiveRouteStore.shared.select(session, index) },
+            closeRouteChoice = { session -> ActiveRouteStore.shared.closeChoice(session) },
+            onGpsFix = routeKeeper::onGpsFix,
         ) as T
     }
 }

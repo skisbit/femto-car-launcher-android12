@@ -1,5 +1,6 @@
 package io.github.seijikohara.femto.data.routing
 
+import btools.router.OsmTrack
 import btools.router.RoutingContext
 import btools.router.RoutingEngine
 import btools.router.RoutingParamCollector
@@ -19,6 +20,7 @@ private class BRouterSearch(
     request: EngineRequest,
 ) : EngineSearch {
     private val referenceOut = request.referenceOut
+    private val alternativeIndex = request.alternativeIndex
 
     // The constructor parses the profile, which BRouter's static ProfileCache keeps for the next search.
     private val engine =
@@ -34,6 +36,9 @@ private class BRouterSearch(
                 // lookups.dat must sit beside the profile: BRouter reads it from the profile's directory.
                 localFunction = request.profile.path
                 memoryclass = request.memoryClassMb
+                // The profile is parsed with these in place of its own values. They also enter the profile's
+                // checksum, so a reference written under other parameters is refused and the search runs in full.
+                if (request.parameters.isNotEmpty()) keyValues = HashMap(request.parameters)
                 // BRouter's fast partial recalculation: a search to the reference's destination stops where it
                 // rejoins the reference. BRouter checks the destination and the profile's checksum itself.
                 rawTrackPath = request.referenceIn?.path
@@ -43,6 +48,7 @@ private class BRouterSearch(
                     startDirection = heading
                     forceUseStartDirection = true
                 }
+                setAlternativeIdx(request.alternativeIndex)
             },
             RoutingEngine.BROUTER_ENGINEMODE_ROUTING,
         ).apply { quite = true }
@@ -68,10 +74,22 @@ private class BRouterSearch(
     // the route. The rename keeps a half-written file from ever standing as a reference.
     private fun writeReference(target: File) {
         val raw = engine.foundRawTrack ?: return
+        val reference = if (alternativeIndex == 0) raw else alternativeReference(raw)
         val temp = File(target.parentFile, target.name + ATOMIC_WRITE_TEMP_SUFFIX)
         runCatching {
-            raw.writeBinary(temp.path)
+            reference.writeBinary(temp.path)
             check(temp.renameTo(target)) { "could not rename $temp" }
         }.onFailure { temp.delete() }
     }
+
+    // For a later alternative, BRouter's raw track is still the best route's, computed first on the way. The found
+    // track is the alternative itself; with the raw track's destination, checksums and profile stamp it reads as a
+    // reference BRouter accepts, and a reroute beside the alternative stays on its roads.
+    private fun alternativeReference(raw: OsmTrack): OsmTrack =
+        engine.foundTrack.apply {
+            endPoint = raw.endPoint
+            nogoChecksums = raw.nogoChecksums
+            profileTimestamp = raw.profileTimestamp
+            isDirty = false
+        }
 }
