@@ -7,6 +7,7 @@ import io.github.seijikohara.femto.data.location.LOCATION_STALE_THRESHOLD_MS
 import io.github.seijikohara.femto.data.location.VehicleMotion
 import io.github.seijikohara.femto.data.places.MAX_PLACE_NAME_LENGTH
 import io.github.seijikohara.femto.data.places.PlaceTarget
+import io.github.seijikohara.femto.data.places.ReceivedPlace
 import io.github.seijikohara.femto.data.places.SavedPlace
 import io.github.seijikohara.femto.data.routing.ActiveRouteStore
 import io.github.seijikohara.femto.data.routing.EngineOutcome
@@ -27,6 +28,7 @@ import io.github.seijikohara.femto.testfixtures.RoutingFixture
 import io.github.seijikohara.femto.testfixtures.fakeEngineTrack
 import io.github.seijikohara.femto.testfixtures.fakeRoute
 import io.github.seijikohara.femto.testfixtures.fakeSavedPlace
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -108,6 +110,7 @@ class DestinationViewModelTest {
         placeLocator: FakePlaceLocator = FakePlaceLocator(),
         ioDispatcher: CoroutineDispatcher = StandardTestDispatcher(testScheduler),
         conditions: RouteConditions = RouteConditions(),
+        suggestOtherRoutes: suspend () -> Boolean = { true },
     ): DestinationViewModel {
         routing = RoutingFixture(tempFolder.root, StandardTestDispatcher(testScheduler))
         return DestinationViewModel(
@@ -129,6 +132,7 @@ class DestinationViewModelTest {
             ioDispatcher = ioDispatcher,
             startCandidates = { session, origin -> candidateStarts += session to origin },
             cancelCandidates = { candidateCancels++ },
+            suggestOtherRoutes = suggestOtherRoutes,
         ).also { viewModel ->
             backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { viewModel.uiState.collect {} }
         }
@@ -871,6 +875,61 @@ class DestinationViewModelTest {
             val session = assertNotNull(activeRoute.active.value).session
             assertEquals(listOf(session to RoutePoint(ORIGIN.point.latitude, ORIGIN.point.longitude)), candidateStarts)
         }
+
+    @Test
+    fun a_found_route_with_other_routes_on_opens_the_choice() =
+        runTest {
+            val viewModel = subscribedViewModel(routingAvailable = true, suggestOtherRoutes = { true })
+            routing.installTile(TILE)
+            routing.engine.outcome = fakeEngineTrack()
+
+            viewModel.onAction(DestinationAction.RouteTo(DESTINATION, ORIGIN))
+            advanceUntilIdle()
+
+            assertEquals(true to 1, activeRoute.active.value?.choosing to candidateStarts.size)
+        }
+
+    @Test
+    fun a_found_route_with_other_routes_off_opens_no_choice_and_starts_no_search() =
+        runTest {
+            val viewModel = subscribedViewModel(routingAvailable = true, suggestOtherRoutes = { false })
+            routing.installTile(TILE)
+            routing.engine.outcome = fakeEngineTrack()
+
+            viewModel.onAction(DestinationAction.RouteTo(DESTINATION, ORIGIN))
+            advanceUntilIdle()
+
+            assertEquals(false to 0, activeRoute.active.value?.choosing to candidateStarts.size)
+        }
+
+    // The setting is read as the route is found, a suspension the route had not had there before: a dismiss that lands
+    // in it loses the route, and with it the reference the engine wrote, which no session holds.
+    @Test
+    fun dismissing_while_the_setting_is_read_starts_no_route_and_deletes_its_reference() =
+        runTest {
+            val setting = CompletableDeferred<Boolean>()
+            val viewModel = subscribedViewModel(routingAvailable = true, suggestOtherRoutes = { setting.await() })
+            routing.installTile(TILE)
+            routing.engine.outcome = fakeEngineTrack()
+            routing.engine.writesReference = true
+            viewModel.onAction(DestinationAction.RouteTo(DESTINATION, ORIGIN))
+            advanceUntilIdle()
+            val writtenWhileRead = referenceFiles().size
+
+            viewModel.onAction(DestinationAction.DismissRoute)
+            setting.complete(true)
+            advanceUntilIdle()
+
+            assertEquals(1, writtenWhileRead)
+            assertNull(activeRoute.active.value)
+            assertEquals(emptyList(), referenceFiles())
+        }
+
+    private fun referenceFiles(): List<File> =
+        routing.referenceDir
+            .listFiles()
+            .orEmpty()
+            .toList()
 
     // Once as the run starts, and again right before its search: the old route's candidates hold the planner too.
     @Test
@@ -1687,6 +1746,188 @@ class DestinationViewModelTest {
                     .single()
                     .destination,
             )
+        }
+
+    // --- a place another app sent ----------------------------------------------
+
+    @Test
+    fun a_received_point_is_offered_with_its_name() =
+        runTest {
+            val viewModel = subscribedViewModel()
+
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Found(DESTINATION, "Imabari Castle")))
+
+            assertEquals(
+                DESTINATION to "Imabari Castle",
+                viewModel.uiState.value.let { it.pickedPoint to it.pickedLabel },
+            )
+        }
+
+    @Test
+    fun a_received_query_fills_the_search_field_even_while_moving() =
+        runTest {
+            motion.value = VehicleMotion.MOVING
+            val viewModel = subscribedViewModel()
+            viewModel.onAction(DestinationAction.PickPoint(DESTINATION))
+
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Found(PlaceTarget.Query("Matsuyama Castle"))))
+
+            assertEquals(
+                "Matsuyama Castle" to null,
+                viewModel.uiState.value.let { it.query to it.pickedPoint },
+            )
+        }
+
+    @Test
+    fun an_unreadable_place_shows_the_line_over_the_search() =
+        runTest {
+            val viewModel = subscribedViewModel()
+            viewModel.onAction(DestinationAction.PickPoint(DESTINATION))
+
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Unreadable))
+
+            assertEquals(true to null, viewModel.uiState.value.let { it.receivedUnreadable to it.pickedPoint })
+        }
+
+    @Test
+    fun an_unreadable_place_clears_the_search_before_it() =
+        runTest {
+            val viewModel = subscribedViewModel()
+            viewModel.onAction(
+                DestinationAction.Receive(ReceivedPlace.Found(PlaceTarget.Query("Matsuyama Castle"), "")),
+            )
+
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Unreadable))
+
+            assertEquals("" to true, viewModel.uiState.value.let { it.query to it.receivedUnreadable })
+        }
+
+    @Test
+    fun a_second_place_replaces_the_first() =
+        runTest {
+            val viewModel = subscribedViewModel()
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Unreadable))
+
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Found(DESTINATION, "Imabari Castle")))
+
+            assertEquals(
+                Triple(false, DESTINATION, "Imabari Castle"),
+                viewModel.uiState.value.let { Triple(it.receivedUnreadable, it.pickedPoint, it.pickedLabel) },
+            )
+        }
+
+    @Test
+    fun typing_puts_the_unreadable_line_away() =
+        runTest {
+            val viewModel = subscribedViewModel()
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Unreadable))
+
+            viewModel.onAction(DestinationAction.QueryChanged("Airport"))
+
+            assertFalse(viewModel.uiState.value.receivedUnreadable)
+        }
+
+    @Test
+    fun a_long_press_after_a_received_point_drops_its_name() =
+        runTest {
+            val viewModel = subscribedViewModel()
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Found(DESTINATION, "Imabari Castle")))
+
+            viewModel.onAction(DestinationAction.PickPoint(ORIGIN.point))
+
+            assertEquals("", viewModel.uiState.value.pickedLabel)
+        }
+
+    @Test
+    fun saving_a_received_point_labels_it_with_its_name() =
+        runTest {
+            val viewModel = subscribedViewModel()
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Found(DESTINATION, "Imabari Castle")))
+
+            viewModel.onAction(DestinationAction.SavePickedPoint)
+
+            assertEquals(listOf("Imabari Castle" to DESTINATION), store.current.map { it.label to it.target })
+        }
+
+    // A route's status takes the panel's body over and names no destination: left running, a download prompt for the
+    // old route would stand where the received place should, and Download would route to the old place.
+    @Test
+    fun a_place_received_at_a_download_prompt_stops_the_route_and_shows() =
+        runTest {
+            val viewModel = subscribedViewModel(routingAvailable = true)
+            routing.offerTile(TILE, sizeBytes = TILE_BYTES)
+            viewModel.onAction(DestinationAction.RouteTo(DESTINATION, ORIGIN))
+            advanceUntilIdle()
+            assertEquals(RouteStep.ConfirmDownload(TILE_BYTES), viewModel.uiState.value.route)
+
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Found(OTHER_DESTINATION, "Imabari Castle")))
+            advanceUntilIdle()
+
+            assertEquals(
+                RouteStep.Idle to OTHER_DESTINATION,
+                viewModel.uiState.value.let { it.route to it.pickedPoint },
+            )
+        }
+
+    @Test
+    fun a_place_received_during_a_search_stops_it_and_shows() =
+        runTest {
+            val viewModel = subscribedViewModel(routingAvailable = true)
+            routing.installTile(TILE)
+            routing.engine.outcome = fakeEngineTrack()
+            viewModel.onAction(DestinationAction.RouteTo(DESTINATION, ORIGIN))
+            assertEquals(RouteStep.Computing, viewModel.uiState.value.route)
+
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Found(OTHER_DESTINATION, "Imabari Castle")))
+            advanceUntilIdle()
+
+            assertEquals(
+                Triple(RouteStep.Idle, OTHER_DESTINATION, null),
+                viewModel.uiState.value.let { Triple(it.route, it.pickedPoint, activeRoute.active.value?.route) },
+            )
+        }
+
+    @Test
+    fun speaking_puts_the_unreadable_line_away() =
+        runTest {
+            val viewModel = subscribedViewModel()
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Unreadable))
+
+            viewModel.onAction(DestinationAction.StartListening)
+
+            assertFalse(viewModel.uiState.value.receivedUnreadable)
+        }
+
+    @Test
+    fun a_voice_result_puts_the_unreadable_line_away() =
+        runTest {
+            val viewModel = subscribedViewModel()
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Unreadable))
+
+            speech.mutableState.value = VoiceState.Result("Airport")
+
+            assertEquals("Airport" to false, viewModel.uiState.value.let { it.query to it.receivedUnreadable })
+        }
+
+    @Test
+    fun a_received_name_past_the_name_cap_is_cut_to_it() =
+        runTest {
+            val viewModel = subscribedViewModel()
+
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Found(DESTINATION, "x".repeat(2_000))))
+
+            assertEquals(MAX_PLACE_NAME_LENGTH, viewModel.uiState.value.pickedLabel.length)
+        }
+
+    @Test
+    fun a_received_place_stops_the_microphone_so_no_transcript_overwrites_it() =
+        runTest {
+            val viewModel = subscribedViewModel()
+            viewModel.onAction(DestinationAction.StartListening)
+
+            viewModel.onAction(DestinationAction.Receive(ReceivedPlace.Found(PlaceTarget.Query("Matsuyama Castle"))))
+
+            assertEquals(VoiceState.Idle, viewModel.uiState.value.voice)
         }
 
     private fun PlaceTarget.Point.toRoutePoint() = RoutePoint(latitude, longitude)

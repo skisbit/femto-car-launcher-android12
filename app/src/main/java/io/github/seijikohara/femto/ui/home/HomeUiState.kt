@@ -6,9 +6,11 @@ import io.github.seijikohara.femto.data.calendar.CalendarSnapshot
 import io.github.seijikohara.femto.data.geocoding.ShortAddress
 import io.github.seijikohara.femto.data.location.TripState
 import io.github.seijikohara.femto.data.music.MusicCardState
+import io.github.seijikohara.femto.data.routing.OnLinePoint
 import io.github.seijikohara.femto.data.routing.RerouteStatus
 import io.github.seijikohara.femto.data.routing.RoutePoint
 import io.github.seijikohara.femto.data.routing.RouteProgress
+import io.github.seijikohara.femto.data.routing.RouteRowTime
 import io.github.seijikohara.femto.data.system.SystemStatus
 import io.github.seijikohara.femto.data.weather.WeatherSnapshot
 
@@ -58,6 +60,10 @@ internal data class HomeUiState(
  * The active route as the dashboard shows it: its [line] in travel order, what is left of it from the last fix, and
  * where an automatic reroute of it stands. While the driver may still choose between routes, [choice] is the choice
  * card and [alternativeLines] the routes not selected, which the map draws under the route; otherwise null and empty.
+ * [rowTime] is the time the speed readout's route row shows beside the distance left (Settings → Navigation).
+ * [vehicleOnLine] is the point of the line the map draws the vehicle at while it drives along the route (the point the
+ * route follow matched the fix to, stamped with that fix), or null where the map draws it at the fix: a fix too far
+ * from the line, or the setting off (Settings → Navigation). Only the map reads it; everything else keeps the fix.
  */
 internal data class ActiveRouteState(
     val line: List<RoutePoint>,
@@ -65,6 +71,8 @@ internal data class ActiveRouteState(
     val reroute: RerouteStatus = RerouteStatus.NONE,
     val choice: RouteChoiceState? = null,
     val alternativeLines: List<List<RoutePoint>> = emptyList(),
+    val rowTime: RouteRowTime = RouteRowTime.ARRIVAL,
+    val vehicleOnLine: OnLinePoint? = null,
 )
 
 /**

@@ -17,13 +17,17 @@ import io.github.seijikohara.femto.data.music.MusicCardState
 import io.github.seijikohara.femto.data.music.MusicCommand
 import io.github.seijikohara.femto.data.music.SPECTRUM_BAND_COUNT
 import io.github.seijikohara.femto.data.places.PlaceTarget
+import io.github.seijikohara.femto.data.places.ReceivedPlace
+import io.github.seijikohara.femto.data.places.ReceivedPlaceInbox
 import io.github.seijikohara.femto.data.routing.ActiveRoute
+import io.github.seijikohara.femto.data.routing.OnLinePoint
 import io.github.seijikohara.femto.data.routing.RerouteStatus
 import io.github.seijikohara.femto.data.routing.Route
 import io.github.seijikohara.femto.data.routing.RouteCandidate
 import io.github.seijikohara.femto.data.routing.RouteFix
 import io.github.seijikohara.femto.data.routing.RoutePoint
 import io.github.seijikohara.femto.data.routing.RouteProgress
+import io.github.seijikohara.femto.data.routing.RouteRowTime
 import io.github.seijikohara.femto.data.update.UpdateFailure
 import io.github.seijikohara.femto.data.update.UpdateManifest
 import io.github.seijikohara.femto.data.update.UpdateSettings
@@ -46,6 +50,7 @@ import io.github.seijikohara.femto.testfixtures.fakeUpdateManifest
 import io.github.seijikohara.femto.testfixtures.fakeWeatherSnapshot
 import io.github.seijikohara.femto.ui.home.components.AppsBarShortcut
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -96,6 +101,23 @@ class HomeViewModelTest {
         Dispatchers.resetMain()
     }
 
+    // The view model follows a route on Dispatchers.Default unless it is given another dispatcher. A worker thread of
+    // that pool can still be handing a value to Dispatchers.Main when tearDown resets it, which the test dispatcher
+    // reports as "Dispatchers.Main is used concurrently with setting it" in whichever test is running. So every view
+    // model in this file follows the route on the test's own thread.
+    private fun testRouteDispatcher(): CoroutineDispatcher = UnconfinedTestDispatcher()
+
+    // A view model built here without it would bring the worker thread back, and fail a test only once in a long while.
+    @Test
+    fun `every view model in this file follows the route on a test dispatcher`() {
+        val source = File("src/test/java/io/github/seijikohara/femto/ui/home/HomeViewModelTest.kt").readText()
+
+        assertEquals(
+            Regex("""\bHomeViewModel\(\n""").findAll(source).count(),
+            Regex("""\brouteDispatcher\s=\s""").findAll(source).count(),
+        )
+    }
+
     @Test
     fun `combines all flows into one HomeUiState`() =
         runTest {
@@ -119,6 +141,7 @@ class HomeViewModelTest {
                     calendarFlow = flowOf(calendar),
                     systemStatusFlow = flowOf(systemStatus),
                     tripStateFlow = flowOf(tripState),
+                    routeDispatcher = testRouteDispatcher(),
                 )
             viewModel.uiState.test {
                 val state = awaitItem()
@@ -150,6 +173,7 @@ class HomeViewModelTest {
                     systemStatusFlow = flowOf(fakeSystemStatus()),
                     tripStateFlow = flowOf(fakeTripState()),
                     onlineFlow = flowOf(false),
+                    routeDispatcher = testRouteDispatcher(),
                 )
             backgroundScope.launch { viewModel.uiState.collect {} }
             backgroundScope.launch { viewModel.online.collect {} }
@@ -174,6 +198,7 @@ class HomeViewModelTest {
                     calendarFlow = flowOf(fakeCalendarSnapshot()),
                     systemStatusFlow = flow { throw SecurityException("system status source broke") },
                     tripStateFlow = flowOf(fakeTripState()),
+                    routeDispatcher = testRouteDispatcher(),
                 )
             viewModel.uiState.test {
                 val state = awaitItem()
@@ -206,6 +231,7 @@ class HomeViewModelTest {
                             throw IllegalStateException("system status source broke after emitting")
                         },
                     tripStateFlow = flowOf(fakeTripState()),
+                    routeDispatcher = testRouteDispatcher(),
                 )
             viewModel.uiState.test {
                 val state = awaitItem()
@@ -258,6 +284,7 @@ class HomeViewModelTest {
                     calendarFlow = flowOf(fakeCalendarSnapshot()),
                     systemStatusFlow = flowOf(fakeSystemStatus()),
                     tripStateFlow = flowOf(fakeTripState()),
+                    routeDispatcher = testRouteDispatcher(),
                 )
             // uiState uses WhileSubscribed, so collect it first to make the
             // StateFlow value live before onAction reads uiState.value.location.
@@ -274,6 +301,22 @@ class HomeViewModelTest {
                 cancelAndIgnoreRemainingEvents()
             }
         }
+
+    // The dashboard of a recreated activity (a rotation, or one the system
+    // finished while the launcher was away) reads the same process inbox: once
+    // the panel has taken the place, it must find nothing to open again.
+    @Test
+    fun `a received place reaches the dashboard once and not after a recreation`() {
+        val inbox = ReceivedPlaceInbox()
+        val place = ReceivedPlace.Found(PlaceTarget.Query("Matsuyama Castle"))
+        inbox.offer(place)
+        val first = stubViewModel(receivedPlaces = inbox)
+        assertEquals(place, first.receivedPlace.value)
+
+        first.onAction(HomeAction.ReceivedPlaceHandled(place))
+
+        assertNull(stubViewModel(receivedPlaces = inbox).receivedPlace.value)
+    }
 
     @Test
     fun `onAction Navigate with a typed query emits LaunchDestination for the query`() =
@@ -630,6 +673,7 @@ class HomeViewModelTest {
                     systemStatusFlow = flowOf(fakeSystemStatus()),
                     tripStateFlow = flowOf(fakeTripState()),
                     resumeLastPlayed = { attemptPlays.await() },
+                    routeDispatcher = testRouteDispatcher(),
                 )
             val dashboard = backgroundScope.launch { viewModel.uiState.collect { } }
             runCurrent()
@@ -842,6 +886,7 @@ class HomeViewModelTest {
                     systemStatusFlow = flowOf(fakeSystemStatus()),
                     tripStateFlow = flowOf(fakeTripState()),
                     updateStateFlow = flow { throw IllegalStateException("updater broke") },
+                    routeDispatcher = testRouteDispatcher(),
                 )
             val state = settledState(viewModel)
             assertFalse(state.updateBadge)
@@ -864,6 +909,7 @@ class HomeViewModelTest {
                     systemStatusFlow = flowOf(fakeSystemStatus()),
                     tripStateFlow = flowOf(fakeTripState()),
                     updateStateFlow = flow { awaitCancellation() },
+                    routeDispatcher = testRouteDispatcher(),
                 )
             val state = settledState(viewModel)
             assertEquals(weather, state.weather)
@@ -1153,6 +1199,7 @@ class HomeViewModelTest {
             updateStateFlow = flowOf(update),
             updateSettingsFlow = flowOf(settings),
             nowElapsedRealtimeNanos = { BADGE_NOW },
+            routeDispatcher = testRouteDispatcher(),
         )
 
     // Subscribes the way the dashboard does, to its combined state and to the
@@ -1221,6 +1268,7 @@ class HomeViewModelTest {
             updateSettingsFlow = settings,
             recordUpdatePrompted = record,
             nowElapsedRealtimeNanos = { virtualNowNanos() },
+            routeDispatcher = testRouteDispatcher(),
         )
 
     private fun liveGpsFix(): Location =
@@ -1249,6 +1297,7 @@ class HomeViewModelTest {
             tripStateFlow = flowOf(fakeTripState()),
             spectrumEnabledFlow = flowOf(enabled),
             spectrumBandsFor = { active -> active.map { if (it) bands else null } },
+            routeDispatcher = testRouteDispatcher(),
         )
 
     // Every source emits, so the card holds [musicState]; subscribed the way the
@@ -1266,6 +1315,7 @@ class HomeViewModelTest {
             systemStatusFlow = flowOf(fakeSystemStatus()),
             tripStateFlow = flowOf(fakeTripState()),
             resumeLastPlayed = resume,
+            routeDispatcher = testRouteDispatcher(),
         ).also { settledState(it) }
 
     private suspend fun HomeViewModel.assertEvent(
@@ -1427,6 +1477,79 @@ class HomeViewModelTest {
             val route = assertNotNull(viewModel.uiState.value.activeRoute)
             assertEquals(RerouteStatus.REROUTING, route.reroute)
             assertEquals(11_000.0, route.progress.remainingMeters, 1.0)
+        }
+
+    @Test
+    fun `the route row shows the arrival time until the setting picks the time remaining`() =
+        runTest {
+            val rowTime = MutableStateFlow(RouteRowTime.ARRIVAL)
+            val viewModel = routeViewModel(available = true, routeRowTimeFlow = rowTime)
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { viewModel.uiState.collect {} }
+            assertEquals(
+                RouteRowTime.ARRIVAL,
+                viewModel.uiState.value.activeRoute
+                    ?.rowTime,
+            )
+
+            rowTime.value = RouteRowTime.REMAINING
+
+            assertEquals(
+                RouteRowTime.REMAINING,
+                viewModel.uiState.value.activeRoute
+                    ?.rowTime,
+            )
+        }
+
+    // Like the route itself, the setting is seeded, so a slow settings store never holds the dashboard back.
+    @Test
+    fun `a route row time not yet read shows the route with the arrival time`() =
+        runTest {
+            val viewModel = routeViewModel(available = true, routeRowTimeFlow = flow { awaitCancellation() })
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { viewModel.uiState.collect {} }
+
+            assertEquals(RouteRowTime.ARRIVAL, assertNotNull(viewModel.uiState.value.activeRoute).rowTime)
+        }
+
+    // --- The vehicle on the line ------------------------------------------------
+
+    @Test
+    fun `the route carries the point of the line the map draws the vehicle at`() =
+        runTest {
+            val viewModel = routeViewModel(location = besideTheRoute(), available = true)
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { viewModel.uiState.collect {} }
+
+            assertOnTheLineHalfway(assertNotNull(viewModel.uiState.value.activeRoute).vehicleOnLine)
+        }
+
+    @Test
+    fun `with the setting off the route carries no point, so the map draws the fix`() =
+        runTest {
+            val viewModel =
+                routeViewModel(location = besideTheRoute(), available = true, vehicleOnLineEnabled = flowOf(false))
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { viewModel.uiState.collect {} }
+
+            val route = assertNotNull(viewModel.uiState.value.activeRoute)
+            assertEquals(11_000.0, route.progress.remainingMeters, 1.0, "the route follows the fix")
+            assertNull(route.vehicleOnLine)
+        }
+
+    // A follow that started over would place no fix until the next one arrives: the progress back at the start, the
+    // off-route watch unarmed, and no point on the line.
+    @Test
+    fun `switching the setting off and on again keeps the follow going`() =
+        runTest {
+            // Fixes that are not replayed: a follow that started over would see none.
+            val location = MutableSharedFlow<Location?>()
+            val enabled = MutableStateFlow(true)
+            val viewModel = routeViewModel(locationFlow = location, available = true, vehicleOnLineEnabled = enabled)
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { viewModel.uiState.collect {} }
+            location.emit(besideTheRoute())
+
+            enabled.value = false
+            assertNull(assertNotNull(viewModel.uiState.value.activeRoute).vehicleOnLine)
+            enabled.value = true
+
+            assertOnTheLineHalfway(assertNotNull(viewModel.uiState.value.activeRoute).vehicleOnLine)
         }
 
     // Cheap GPS receivers leave the speed unset while moving.
@@ -1727,6 +1850,16 @@ class HomeViewModelTest {
             provider = provider,
         )
 
+    // About 5.6 m north of the equator route, halfway along it.
+    private fun besideTheRoute(): Location = fakeLocation(latitude = 0.00005, longitude = 0.1)
+
+    // [drawn] is at the equator route's halfway point, to a micro-degree.
+    private fun assertOnTheLineHalfway(drawn: OnLinePoint?) {
+        assertNotNull(drawn)
+        assertEquals(0.0, drawn.point.latitude, MICRODEGREE)
+        assertEquals(0.1, drawn.point.longitude, MICRODEGREE)
+    }
+
     private fun activeRouteOf(route: Route): ActiveRoute =
         ActiveRoute(SESSION, route, ROUTE_DESTINATION, reference = null)
 
@@ -1747,6 +1880,8 @@ class HomeViewModelTest {
         closeRouteChoice: (Long) -> Unit = {},
         onGpsFix: (Long) -> Unit = {},
         nowElapsedRealtimeNanos: () -> Long = SystemClock::elapsedRealtimeNanos,
+        routeRowTimeFlow: Flow<RouteRowTime> = flowOf(RouteRowTime.ARRIVAL),
+        vehicleOnLineEnabled: Flow<Boolean> = flowOf(true),
     ): HomeViewModel =
         HomeViewModel(
             locationFlow = locationFlow,
@@ -1766,6 +1901,8 @@ class HomeViewModelTest {
             routeDispatcher = UnconfinedTestDispatcher(testScheduler),
             onGpsFix = onGpsFix,
             nowElapsedRealtimeNanos = nowElapsedRealtimeNanos,
+            routeRowTimeFlow = routeRowTimeFlow,
+            vehicleOnLineEnabled = vehicleOnLineEnabled,
         )
 
     private fun stubViewModel(
@@ -1773,6 +1910,7 @@ class HomeViewModelTest {
         resumeLastMusicSession: () -> Unit = {},
         resetTrip: () -> Unit = {},
         resolveMusicSourceComponent: (String) -> ComponentName? = { null },
+        receivedPlaces: ReceivedPlaceInbox = ReceivedPlaceInbox(),
     ): HomeViewModel =
         HomeViewModel(
             locationFlow = emptyFlow(),
@@ -1786,6 +1924,8 @@ class HomeViewModelTest {
             resumeLastMusicSession = resumeLastMusicSession,
             resetTrip = resetTrip,
             resolveMusicSourceComponent = resolveMusicSourceComponent,
+            receivedPlaces = receivedPlaces,
+            routeDispatcher = testRouteDispatcher(),
         )
 
     private companion object {
@@ -1806,6 +1946,9 @@ class HomeViewModelTest {
         const val OFF_ROUTE_LATITUDE = 0.001
         const val EAST = 90f
         const val FIX_ACCURACY_M = 5f
+
+        // The precision of an engine route's points.
+        const val MICRODEGREE = 1e-6
 
         // A provider that counts as GPS (anything but the network provider), and the trip's speed from the positions.
         const val TEST_PROVIDER = "test"

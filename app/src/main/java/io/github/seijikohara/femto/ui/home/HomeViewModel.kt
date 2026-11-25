@@ -45,14 +45,18 @@ import io.github.seijikohara.femto.data.music.MusicCommand
 import io.github.seijikohara.femto.data.music.MusicSessionRepository
 import io.github.seijikohara.femto.data.music.PlatformResumePort
 import io.github.seijikohara.femto.data.music.ResumeOutcome
+import io.github.seijikohara.femto.data.places.ReceivedPlace
+import io.github.seijikohara.femto.data.places.ReceivedPlaceInbox
 import io.github.seijikohara.femto.data.routing.ActiveRoute
 import io.github.seijikohara.femto.data.routing.ActiveRouteStore
 import io.github.seijikohara.femto.data.routing.FollowEvent
+import io.github.seijikohara.femto.data.routing.NavigationPreferences
 import io.github.seijikohara.femto.data.routing.RerouteStatus
 import io.github.seijikohara.femto.data.routing.Rerouter
 import io.github.seijikohara.femto.data.routing.RouteFix
 import io.github.seijikohara.femto.data.routing.RoutePersistence
 import io.github.seijikohara.femto.data.routing.RoutePoint
+import io.github.seijikohara.femto.data.routing.RouteRowTime
 import io.github.seijikohara.femto.data.routing.followFlow
 import io.github.seijikohara.femto.data.routing.routingAvailableFlow
 import io.github.seijikohara.femto.data.system.SystemStatus
@@ -160,6 +164,15 @@ internal class HomeViewModel(
     // stamp and its check at the first fix, which also runs with no route on
     // the map. Defaults to nowhere, so previews and tests are unaffected.
     private val onGpsFix: (timeEpochMs: Long) -> Unit = {},
+    // Where a place another app sent waits for the dashboard. Defaults to an
+    // inbox of its own, so previews and tests receive nothing.
+    private val receivedPlaces: ReceivedPlaceInbox = ReceivedPlaceInbox(),
+    // Which time the speed readout's route row shows (Settings → Navigation).
+    // Defaults to the arrival time, the row as it was before the setting.
+    routeRowTimeFlow: Flow<RouteRowTime> = flowOf(RouteRowTime.ARRIVAL),
+    // Whether the map draws the vehicle on the route line while it drives
+    // along it (Settings → Navigation). Defaults to on, the setting's default.
+    vehicleOnLineEnabled: Flow<Boolean> = flowOf(true),
 ) : ViewModel() {
     // The builds the update prompt has been answered about in this process. The
     // prompt closes on the answer itself, not on the store's write: a slow disk
@@ -288,6 +301,7 @@ internal class HomeViewModel(
                             reroute = view.reroute,
                             choice = view.choice,
                             alternativeLines = view.alternativeLines,
+                            vehicleOnLine = follow.onLine,
                         )
                     }
                 } ?: flowOf(null)
@@ -331,13 +345,38 @@ internal class HomeViewModel(
             .distinctUntilChanged()
             .catchAsDefault(TAG, "routing available", false)
 
+    // Seeded with the arrival time for the same reason; the row takes the
+    // stored choice as soon as it is read.
+    private val routeRowTime: Flow<RouteRowTime> =
+        routeRowTimeFlow
+            .onStart { emit(RouteRowTime.ARRIVAL) }
+            .distinctUntilChanged()
+            .catchAsDefault(TAG, "route row time", RouteRowTime.ARRIVAL)
+
+    // Seeded with the setting's default for the same reason. Applied here,
+    // after the follow, like the row's time: switching it never restarts the
+    // follow, which would put the progress back to the start of the line.
+    private val drawVehicleOnLine: Flow<Boolean> =
+        vehicleOnLineEnabled
+            .onStart { emit(true) }
+            .distinctUntilChanged()
+            .catchAsDefault(TAG, "vehicle on line", true)
+
     val uiState: StateFlow<HomeUiState> =
         combine(
             coreSignals,
             calendarFlow.catchAsDefault(TAG, "calendar", HomeUiState.Initial.calendar),
             systemStatusFlow.catchAsDefault(TAG, "system status", HomeUiState.Initial.systemStatus),
             tripStateFlow.catchAsDefault(TAG, "trip state", HomeUiState.Initial.tripState),
-            combine(activeRoute, routingOffered, routeChoiceAutoClose) { route, offered, _ -> route to offered },
+            combine(
+                activeRoute,
+                routingOffered,
+                routeChoiceAutoClose,
+                routeRowTime,
+                drawVehicleOnLine,
+            ) { route, offered, _, time, onLine ->
+                route?.copy(rowTime = time, vehicleOnLine = route.vehicleOnLine?.takeIf { onLine }) to offered
+            },
         ) { core, calendar, systemStatus, tripState, (route, offered) ->
             HomeUiState(
                 location = core.location,
@@ -421,6 +460,16 @@ internal class HomeViewModel(
             }.distinctUntilChanged(),
         ).stateIn(viewModelScope, WhileUiSubscribed, null)
 
+    /**
+     * A place another app sent (the share sheet or a `geo:` link), waiting for
+     * the destination panel, or null. A state rather than an [events] entry:
+     * on a cold start through a share the place arrives before the dashboard
+     * is composed, and an event with no collector would be lost. The panel
+     * reports the place taken ([HomeAction.ReceivedPlaceHandled]), which
+     * empties the inbox, so a recreated dashboard opens nothing again.
+     */
+    val receivedPlace: StateFlow<ReceivedPlace?> = receivedPlaces.pending
+
     // extraBufferCapacity = 1 lets a single tryEmit succeed without a live collector,
     // matching the semantics of a one-shot navigation request that is dropped if the
     // host is already detached (e.g. during configuration change).
@@ -459,6 +508,10 @@ internal class HomeViewModel(
 
             is HomeAction.Navigate -> {
                 mutableEvents.tryEmit(HomeEvent.LaunchDestination(action.target, action.label))
+            }
+
+            is HomeAction.ReceivedPlaceHandled -> {
+                receivedPlaces.handled(action.place)
             }
 
             is HomeAction.Shortcut -> {
@@ -815,6 +868,7 @@ internal class HomeViewModelFactory(
         // off the main thread while the dashboard opens. A build without
         // routing only deletes what an earlier build left.
         val routeKeeper = RoutePersistence.get(application).apply { start(enabled = routingEnabled) }
+        val navigationSettings = NavigationPreferences(application).settings
 
         @Suppress("UNCHECKED_CAST")
         return HomeViewModel(
@@ -858,6 +912,9 @@ internal class HomeViewModelFactory(
             selectRouteCandidate = { session, index -> ActiveRouteStore.shared.select(session, index) },
             closeRouteChoice = { session -> ActiveRouteStore.shared.closeChoice(session) },
             onGpsFix = routeKeeper::onGpsFix,
+            receivedPlaces = ReceivedPlaceInbox.shared,
+            routeRowTimeFlow = navigationSettings.map { it.routeRowTime },
+            vehicleOnLineEnabled = navigationSettings.map { it.vehicleOnRouteLine },
         ) as T
     }
 }
