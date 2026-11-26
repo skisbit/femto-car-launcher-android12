@@ -214,8 +214,8 @@ internal data class VideoSettingsUi(
 }
 
 /**
- * The Navigation category's rows (issue #389): what the route preview does besides the line on the map, and how the map
- * draws the vehicle along it.
+ * The Navigation category's rows (issue #389): what the route preview does besides the line on the map, what the turn
+ * card over the map shows, and how the map draws the vehicle along it.
  */
 internal data class NavigationSettingsUi(
     val rerouteAutomatically: Boolean,
@@ -223,6 +223,9 @@ internal data class NavigationSettingsUi(
     val restoreRouteAfterRestart: Boolean,
     val routeRowTime: RouteRowTime,
     val vehicleOnRouteLine: Boolean,
+    val turnCard: Boolean,
+    val turnCardNextAfter: Boolean,
+    val turnCardStraight: Boolean,
 ) {
     companion object {
         val Initial =
@@ -232,6 +235,9 @@ internal data class NavigationSettingsUi(
                 restoreRouteAfterRestart = NavigationSettings.Default.restoreRouteAfterRestart,
                 routeRowTime = NavigationSettings.Default.routeRowTime,
                 vehicleOnRouteLine = NavigationSettings.Default.vehicleOnRouteLine,
+                turnCard = NavigationSettings.Default.turnCard,
+                turnCardNextAfter = NavigationSettings.Default.turnCardNextAfter,
+                turnCardStraight = NavigationSettings.Default.turnCardStraight,
             )
     }
 }
@@ -552,6 +558,21 @@ internal sealed interface SettingsAction {
         val value: Boolean,
     ) : SettingsAction
 
+    /** Show the next turn in a card over the map while a route is on, or not. */
+    data class SetTurnCard(
+        val value: Boolean,
+    ) : SettingsAction
+
+    /** Show the turn after next on the turn card when it follows closely, or not. */
+    data class SetTurnCardNextAfter(
+        val value: Boolean,
+    ) : SettingsAction
+
+    /** Have the turn card also announce "continue straight", or not. */
+    data class SetTurnCardStraight(
+        val value: Boolean,
+    ) : SettingsAction
+
     /** Check this channel's release feed now. */
     data object CheckForUpdates : SettingsAction
 
@@ -627,11 +648,20 @@ internal sealed interface SettingsAction {
     data object AcknowledgeUpdatedTo : SettingsAction
 
     /**
-     * Restore every display + font + location + calendar + update + video + navigation setting to its default value.
+     * Restore each of [sections] exactly as its own [ResetSection] does, all in one go, and delete the keys and
+     * addresses the person entered only when [deleteEnteredValues] is set; that also puts the map provider back to its
+     * default ([SettingsSectionId.ENTERED_VALUE_RESET_KEYS]). Every section plus the entered values restores every
+     * setting the section stores hold.
      */
-    data object ResetToDefaults : SettingsAction
+    data class ResetSettings(
+        val sections: Set<SettingsSectionId>,
+        val deleteEnteredValues: Boolean,
+    ) : SettingsAction
 
-    /** Restore only [sectionId]'s own settings (and any store it owns) to their default value. */
+    /**
+     * Restore only [sectionId]'s own settings (and any store it owns) to their default value. The keys and addresses
+     * the person entered stay ([SettingsSectionId.ENTERED_VALUE_KEYS]).
+     */
     data class ResetSection(
         val sectionId: SettingsSectionId,
     ) : SettingsAction
