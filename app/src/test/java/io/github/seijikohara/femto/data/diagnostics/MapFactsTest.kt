@@ -18,6 +18,12 @@ import io.github.seijikohara.femto.data.routing.RouteConditions
 import io.github.seijikohara.femto.data.routing.RouteRestoreDecision
 import io.github.seijikohara.femto.data.routing.RouteRun
 import io.github.seijikohara.femto.data.routing.RouteRunOutcome
+import io.github.seijikohara.femto.data.voice.EnglishVoice
+import io.github.seijikohara.femto.data.voice.PromptOutcome
+import io.github.seijikohara.femto.data.voice.SpeakerStatus
+import io.github.seijikohara.femto.data.voice.SpeakerUnavailable
+import io.github.seijikohara.femto.data.voice.SpeechEngine
+import io.github.seijikohara.femto.data.voice.SpokenPrompt
 import org.junit.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -671,6 +677,138 @@ class MapFactsTest {
                 .value,
         )
     }
+
+    // A head unit with no engine is the normal case, so the line is a plain value and never a warning.
+    @Test
+    fun `a device with no speech engine says so in every build`() {
+        val texts =
+            listOf(true, false).map { buildEnabled ->
+                speechFact(RoutingFacts(buildEnabled, null, null, true, speechEngines = emptyList()))?.value
+            }
+
+        assertEquals(List(2) { FactValue.Text("no engine") }, texts)
+    }
+
+    @Test
+    fun `each speech engine is named with what it said about English, the default one marked`() {
+        val engines =
+            listOf(
+                SpeechEngine("com.example.tts", isDefault = true, english = EnglishVoice.AVAILABLE),
+                SpeechEngine("com.example.other", isDefault = false, english = EnglishVoice.NOT_SUPPORTED),
+            )
+
+        assertEquals(
+            FactValue.Text("com.example.tts (default): English available; com.example.other: no English"),
+            speechFact(RoutingFacts(true, emptyList(), null, true, speechEngines = engines))?.value,
+        )
+    }
+
+    // Missing voice data can be downloaded and a silent engine cannot be used, so the line keeps every answer apart.
+    @Test
+    fun `every answer of a speech engine has its own words`() {
+        val words =
+            EnglishVoice.entries.map { english ->
+                val engine = SpeechEngine("com.example.tts", isDefault = false, english = english)
+                speechFact(RoutingFacts(true, emptyList(), null, true, speechEngines = listOf(engine)))?.value
+            }
+
+        assertEquals(
+            listOf(
+                "English available",
+                "English voice data missing",
+                "no English",
+                "did not start",
+                "did not answer",
+            ).map { FactValue.Text("com.example.tts: $it") },
+            words,
+        )
+    }
+
+    @Test
+    fun `speech engines that were not asked add no line`() {
+        assertEquals(null, speechFact(RoutingFacts(true, emptyList(), null, true)))
+    }
+
+    @Test
+    fun `a build without routing has no voice line`() {
+        assertEquals(null, voiceFact(RoutingFacts(false, null, null, true, speechEngines = emptyList())))
+    }
+
+    @Test
+    fun `voice that the settings switch off says so, whatever the speaker is doing`() {
+        assertEquals(
+            FactValue.Text("off in Settings"),
+            voiceFact(voice(wanted = false, status = SpeakerStatus.Ready("com.example.tts")))?.value,
+        )
+    }
+
+    @Test
+    fun `a speaker that is closed reads as waiting for a route`() {
+        assertEquals(FactValue.Text("on, no route followed"), voiceFact(voice(status = SpeakerStatus.Closed))?.value)
+    }
+
+    @Test
+    fun `a speaker that is opening says so`() {
+        assertEquals(FactValue.Text("opening the engine"), voiceFact(voice(status = SpeakerStatus.Opening))?.value)
+    }
+
+    @Test
+    fun `a ready speaker names its engine, and says no prompt yet before the first`() {
+        assertEquals(
+            FactValue.Text("com.example.tts; no prompt yet"),
+            voiceFact(voice(status = SpeakerStatus.Ready("com.example.tts")))?.value,
+        )
+    }
+
+    @Test
+    fun `a ready speaker names the last prompt by its stage and distance and how it ended`() {
+        val outcomes =
+            listOf(null) + PromptOutcome.entries
+        assertEquals(
+            listOf(
+                "playing",
+                "played",
+                "cut short",
+                "no sound granted",
+                "refused by the engine",
+                "engine not ready",
+            ).map { FactValue.Text("com.example.tts; last prompt: final at 80 m, $it") },
+            outcomes.map { outcome ->
+                voiceFact(
+                    voice(
+                        status = SpeakerStatus.Ready("com.example.tts"),
+                        lastPrompt = SpokenPrompt("final at 80 m", outcome),
+                    ),
+                )?.value
+            },
+        )
+    }
+
+    @Test
+    fun `a speaker that cannot speak says why`() {
+        assertEquals(
+            listOf(
+                "cannot speak: no engine",
+                "cannot speak: no English voice",
+                "cannot speak: the engine did not start",
+            ).map { FactValue.Text(it) },
+            SpeakerUnavailable.entries.map { reason ->
+                voiceFact(voice(status = SpeakerStatus.Unavailable(reason)))?.value
+            },
+        )
+    }
+
+    private fun voice(
+        wanted: Boolean = true,
+        status: SpeakerStatus,
+        lastPrompt: SpokenPrompt? = null,
+    ) = RoutingFacts(true, emptyList(), null, true, voice = VoiceFacts(wanted, status, lastPrompt))
+
+    private fun voiceFact(routing: RoutingFacts): DiagnosticFact? =
+        facts(routing = routing).singleOrNull { it.label == "Voice" }
+
+    private fun speechFact(routing: RoutingFacts): DiagnosticFact? =
+        facts(routing = routing).singleOrNull { it.label == "Text-to-speech" }
 
     private fun routingFacts(
         routing: RoutingFacts,
